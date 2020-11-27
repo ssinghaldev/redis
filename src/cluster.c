@@ -31,6 +31,7 @@
 #include "server.h"
 #include "cluster.h"
 #include "endianconv.h"
+#include "quic.h"
 
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -78,6 +79,12 @@ sds representClusterNodeFlags(sds ci, uint16_t flags);
 uint64_t clusterGetMaxEpoch(void);
 int clusterBumpConfigEpochWithoutConsensus(void);
 void moduleCallClusterReceivers(const char *sender_id, uint64_t module_id, uint8_t type, const unsigned char *payload, uint32_t len);
+
+/* Quic related functions */
+int quicInit(quicHandlers *handlers, int port);
+void closeHandlers(quicHandlers *handlers);
+int initQuicServer(quicHandlers *handlers, int port, QUIC_BUFFER alpn);
+int initQuicClient(quicHandlers *handlers, int port, QUIC_BUFFER alpn);
 
 /* -----------------------------------------------------------------------------
  * Initialization
@@ -450,6 +457,198 @@ void clusterUpdateMyselfFlags(void) {
     }
 }
 
+int initQuicServer(
+    quicHandlers *handlers, 
+    int port, 
+    QUIC_BUFFER alpn)
+{
+    int initialized =  1;
+    QUIC_STATUS status = QUIC_STATUS_SUCCESS;
+    QUIC_ADDR address;
+    QuicAddrSetFamily(&address, QUIC_ADDRESS_FAMILY_UNSPEC);
+    QuicAddrSetPort(&address, port);
+
+    QUIC_SETTINGS settings;
+    settings.IdleTimeoutMs = server.quic_config.idle_timeout_ms;
+    settings.IsSet.IdleTimeoutMs = server.quic_config.is_set_idle_timeout_ms;
+    settings.PeerBidiStreamCount = server.quic_config.peer_bidi_stream_count;
+    settings.IsSet.PeerBidiStreamCount = server.quic_config.is_set_peer_bidi_stream_count;
+    settings.PeerUnidiStreamCount = server.quic_config.peer_uni_stream_count;
+    settings.IsSet.PeerUnidiStreamCount = server.quic_config.is_set_peer_uni_stream_count;
+
+    QUIC_CREDENTIAL_CONFIG config;
+    QUIC_CERTIFICATE_FILE cert_file;
+    memset(&config, 0, sizeof(config));
+    config.Flags = QUIC_CREDENTIAL_FLAG_NONE;
+    if (server.quic_config.cert_file != NULL && 
+            server.quic_config.key_file != NULL) 
+    {
+        cert_file.CertificateFile = server.quic_config.cert_file;
+        cert_file.PrivateKeyFile = server.quic_config.key_file;
+        config.Type = QUIC_CREDENTIAL_TYPE_CERTIFICATE_FILE;
+        config.CertificateFile = &cert_file;
+    } 
+    else 
+    {
+        serverLog(LL_WARNING,"Must specify cert_file and key_file.");
+        initialized = 0;
+    }
+
+    if (initialized && QUIC_FAILED(status = handlers->msquic->ConfigurationOpen(
+                        handlers->registration, 
+                        &alpn, 
+                        1, 
+                        &settings, 
+                        sizeof(settings), 
+                        NULL, 
+                        &handlers->server_configuration))) 
+    {
+        printf("ConfigurationOpen failed, 0x%x!\n", status);
+        serverLog(LL_WARNING,"Quic server ConfigurationOpen failed.");
+        initialized = 0;;
+    }
+
+    if (initialized && QUIC_FAILED(status = handlers->msquic->ConfigurationLoadCredential(
+                        handlers->server_configuration, 
+                        &config)))
+    {
+        serverLog(LL_WARNING,"Quic server ConfigurationLoadCredential failed.");
+        initialized = 0;
+    }
+
+
+    if (initialized && QUIC_FAILED(status = handlers->msquic->ListenerOpen(
+                        handlers->registration, 
+                        ServerListenerCallback,
+                        NULL, 
+                        &handlers->listener))) 
+    {
+        serverLog(LL_WARNING,"Quic server ListenerOpen failed.");
+        initialized = 0;;
+    }
+
+    if (initialized && QUIC_FAILED(status = handlers->msquic->ListenerStart(
+                        handlers->listener, 
+                        &alpn, 
+                        1, 
+                        &address))) 
+    {
+        serverLog(LL_WARNING,"Quic server ListenerStart failed.");
+        initialized = 0;;
+    }
+
+    return initialized;
+}
+
+int initQuicClient(
+    quicHandlers *handlers, 
+    int port, 
+    QUIC_BUFFER alpn)
+{
+    int initialized = 1;
+    QUIC_STATUS status = QUIC_STATUS_SUCCESS;
+    QUIC_SETTINGS settings;
+    settings.IdleTimeoutMs = server.quic_config.idle_timeout_ms;
+    settings.IsSet.IdleTimeoutMs = server.quic_config.is_set_idle_timeout_ms;
+    settings.PeerBidiStreamCount = server.quic_config.peer_bidi_stream_count;
+    settings.IsSet.PeerBidiStreamCount = server.quic_config.is_set_peer_bidi_stream_count;
+    settings.PeerBidiStreamCount = server.quic_config.peer_uni_stream_count;
+    settings.IsSet.PeerBidiStreamCount = server.quic_config.is_set_peer_uni_stream_count;
+
+    QUIC_CREDENTIAL_CONFIG cred_config;
+    memset(&cred_config, 0, sizeof(cred_config));
+    cred_config.Type = QUIC_CREDENTIAL_TYPE_NONE;
+    cred_config.Flags = QUIC_CREDENTIAL_FLAG_CLIENT;
+    // TODO: Check certification validation required flags.
+    cred_config.Flags |= QUIC_CREDENTIAL_FLAG_NO_CERTIFICATE_VALIDATION;
+ 
+    if (QUIC_FAILED(status = handlers->msquic->ConfigurationOpen(
+                        handlers->registration, 
+                        &alpn, 
+                        1, 
+                        &settings, 
+                        sizeof(settings), 
+                        NULL, 
+                        &handlers->client_configuration))) 
+    {
+        serverLog(LL_WARNING,"Quic client ConfigurationOpen failed.");
+        initialized = 0;
+    }
+
+    if (initialized && QUIC_FAILED(status = handlers->msquic->ConfigurationLoadCredential(
+                        handlers->client_configuration, 
+                        &cred_config))) 
+    {
+        serverLog(LL_WARNING,"Quic client ConfigurationLoadCredential failed.");
+        initialized = 0;
+    }
+
+    return initialized;
+}
+
+void closeHandlers(quicHandlers *handlers)
+{
+    if (handlers->registration != NULL) 
+    {
+        handlers->msquic->RegistrationClose(handlers->registration);
+    }
+    if (handlers->server_configuration != NULL) 
+    {
+        handlers->msquic->ConfigurationClose(handlers->server_configuration);
+    }
+    if (handlers->client_configuration != NULL) 
+    {
+        handlers->msquic->ConfigurationClose(handlers->client_configuration);
+    }
+    if (handlers->listener != NULL) 
+    {
+        handlers->msquic->ListenerClose(handlers->listener);
+    }
+    MsQuicClose(handlers->msquic);
+}
+
+int quicInit(quicHandlers *handlers, int port)
+{
+    QUIC_STATUS status = QUIC_STATUS_SUCCESS;
+    int initialized = 1;
+    // TODO: Use serverlog function
+    if (QUIC_FAILED(status = MsQuicOpen(&handlers->msquic))) 
+    {
+        serverLog(LL_WARNING,"Unable to open MsQuic lib.");
+        initialized = 0;
+    }
+
+    QUIC_REGISTRATION_CONFIG reg_config = { "quic_redis", QUIC_EXECUTION_PROFILE_LOW_LATENCY };
+    QUIC_BUFFER alpn = { sizeof("sample") - 1, (uint8_t*)"sample" };
+    
+    if (initialized && QUIC_FAILED(status = handlers->msquic->RegistrationOpen(
+                        &reg_config, 
+                        &handlers->registration))) 
+    {
+       serverLog(LL_WARNING,"Quic RegistrationOpen failed.");
+       initialized = 0;
+    }
+
+    if (initialized && !initQuicServer(handlers, port, alpn))
+    {
+        serverLog(LL_WARNING,"QUIC server initialization failed.");
+        initialized = 0;
+    }
+
+    if (initialized && !initQuicClient(handlers, port, alpn))
+    {
+        serverLog(LL_WARNING,"QUIC client initialization failed.");
+        initialized = 0;
+    }
+
+    if (!initialized && handlers->msquic != NULL) 
+    {
+        closeHandlers(handlers);
+    }
+
+    return initialized;
+}
+
 void clusterInit(void) {
     int saveconf = 0;
 
@@ -510,7 +709,14 @@ void clusterInit(void) {
                    "lower than 55535.");
         exit(1);
     }
-    if (listenToPort(port+CLUSTER_PORT_INCR,
+
+    server.cluster->quic_handlers = zmalloc(sizeof(quicHandlers));
+    if(server.quic_config.quic_enabled && !quicInit(server.cluster->quic_handlers, port))
+    {
+        serverLog(LL_WARNING, "Unable to initialize QUIC listener.");
+        exit(1);
+    }
+    else if (listenToPort(port+CLUSTER_PORT_INCR,
         server.cfd,&server.cfd_count) == C_ERR)
     {
         exit(1);

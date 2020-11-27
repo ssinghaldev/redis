@@ -1,6 +1,8 @@
 #ifndef __CLUSTER_H
 #define __CLUSTER_H
 
+#include <msquic.h>
+
 /*-----------------------------------------------------------------------------
  * Redis cluster data structures, defines, exported API.
  *----------------------------------------------------------------------------*/
@@ -137,6 +139,16 @@ typedef struct clusterNode {
     list *fail_reports;         /* List of nodes signaling this as failing */
 } clusterNode;
 
+typedef struct quicHandlers
+{
+    QUIC_API_TABLE* msquic;
+    HQUIC registration;
+    // QUIC_REGISTRATION_CONFIG reg_config;
+    HQUIC server_configuration;
+    HQUIC client_configuration;
+    HQUIC listener;
+}quicHandlers;
+
 typedef struct clusterState {
     clusterNode *myself;  /* This node */
     uint64_t currentEpoch;
@@ -175,6 +187,7 @@ typedef struct clusterState {
     long long stats_bus_messages_received[CLUSTERMSG_TYPE_COUNT];
     long long stats_pfail_nodes;    /* Number of nodes in PFAIL status,
                                        excluding nodes without address. */
+    quicHandlers *quic_handlers;
 } clusterState;
 
 /* Redis cluster messages header */

@@ -2401,6 +2401,17 @@ standardConfig configs[] = {
     createStringConfig("tls-ciphersuites", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.ciphersuites, NULL, NULL, updateTlsCfg),
 #endif
 
+    /* QUIC configs */
+    createBoolConfig("quic-enabled", NULL, IMMUTABLE_CONFIG, server.quic_config.quic_enabled, 1, NULL, NULL), 
+    createBoolConfig("is_set_peer_uni_stream_count", NULL, IMMUTABLE_CONFIG, server.quic_config.is_set_peer_uni_stream_count, 1, NULL, NULL), 
+    createBoolConfig("is_set_peer_bidi_stream_count", NULL, IMMUTABLE_CONFIG, server.quic_config.is_set_peer_bidi_stream_count, 0, NULL, NULL), 
+    createBoolConfig("is_set_idle_timeout_ms", NULL, IMMUTABLE_CONFIG, server.quic_config.is_set_idle_timeout_ms, 1, NULL, NULL),
+    createIntConfig("peer_uni_stream_count", NULL, IMMUTABLE_CONFIG, 0, 65535, server.quic_config.peer_uni_stream_count, 60000, INTEGER_CONFIG, NULL, NULL), 
+    createIntConfig("peer_bidi_stream_count", NULL, IMMUTABLE_CONFIG, 0, 65535, server.quic_config.peer_bidi_stream_count, 60000, INTEGER_CONFIG, NULL, NULL), 
+    createLongLongConfig("idle_timeout_ms", NULL, MODIFIABLE_CONFIG, 0, LLONG_MAX, server.quic_config.idle_timeout_ms, 300000, INTEGER_CONFIG, NULL, NULL),
+    createStringConfig("quic-cert-file", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.quic_config.cert_file, NULL, NULL, NULL),
+    createStringConfig("quic-key-file", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.quic_config.key_file, NULL, NULL, NULL),
+    
     /* NULL Terminator */
     {NULL}
 };
