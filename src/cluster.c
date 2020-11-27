@@ -86,6 +86,7 @@ int initQuicClient(int port, QUIC_BUFFER alpn);
 QUIC_STATUS serverListenerCallBack(HQUIC listener, void* context, QUIC_LISTENER_EVENT* Event);
 QUIC_STATUS serverConnectionCallBack(HQUIC Connection, void *Context, QUIC_CONNECTION_EVENT *Event);
 QUIC_STATUS serverStreamCallBack(HQUIC Stream, void *Context, QUIC_STREAM_EVENT *Event);
+void serverStreamReadHandler(quicConnection *context, QUIC_BUFFER* buffers, uint32_t bufferCount); 
 
 /* -----------------------------------------------------------------------------
  * Initialization
@@ -6143,6 +6144,7 @@ QUIC_STATUS serverConnectionCallBack(HQUIC Connection, void *Context, QUIC_CONNE
             
             //DOUBT: There might be a problem typecasting. Have to see when compiling
             link->conn = conn;
+            //TODO: Check all other places how the conn object is being used and change accordingly.
             connSetPrivateData(&conn->conn, link);
 
             //TODO: Might have to set some statuses/flags (Redis/QUIC specififc). Will see later
@@ -6183,8 +6185,138 @@ QUIC_STATUS serverStreamCallBack(HQUIC Stream, void *Context, QUIC_STREAM_EVENT 
     //Get the connection object from Context
     quicConnection *conn = (quicConnection*)Context;
 
-    switch (Event->Type) {
+    switch (Event->Type) 
+    {
+        case QUIC_STREAM_EVENT_START_COMPLETE:
+        {
+            // This event is triggered if we are using async stream start. 
+            serverLog(LL_NOTICE,"Server received stream start event complete.");
+            break;
+        }
+        case QUIC_STREAM_EVENT_RECEIVE:
+        {
+            serverLog(LL_NOTICE,"Server received stream event receive.");
+            serverStreamReadHandler(Context, Event->RECEIVE.Buffers, Event->RECEIVE.BufferCount);
+            break;
+        }
+        case QUIC_STREAM_EVENT_SEND_COMPLETE:
+        {
+            serverLog(LL_NOTICE,"Server received stream send event complete.");
+            break;
+        }
+        case QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN:
+        {
+            serverLog(LL_NOTICE,"Server received stream peer event send shutdown.");
+            break;
+        }
+        case QUIC_STREAM_EVENT_PEER_SEND_ABORTED:
+        {
+            serverLog(LL_NOTICE,"Server received stream peer event send aborted.");
+            break;
+        }
+        case QUIC_STREAM_EVENT_PEER_RECEIVE_ABORTED:
+        {
+            serverLog(LL_NOTICE,"Server received stream peer event receive aborted.");
+            break;
+        }
+        case QUIC_STREAM_EVENT_SEND_SHUTDOWN_COMPLETE:
+        {
+            serverLog(LL_NOTICE,"Server received stream event send shutdown complete.");
+            break;
+        }
+        case QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE:
+        {
+            serverLog(LL_NOTICE,"Server received stream event shutdown complete.");
+            break;
+        }
+        case QUIC_STREAM_EVENT_IDEAL_SEND_BUFFER_SIZE:
+        {
+            serverLog(LL_NOTICE,"Server received stream event ideal send buffer size.");
+            break;
+        }
     }
 
     return QUIC_STATUS_SUCCESS;
+}
+
+/* Read data. Try to read the first field of the header first to check the
+ * full length of the packet. When a whole packet is in memory this function
+ * will call the function to process the packet. And so forth. */
+void serverStreamReadHandler(
+    quicConnection *context,
+    QUIC_BUFFER* buffers, 
+    uint32_t bufferCount) 
+{
+    connection *conn = &context->conn;
+    clusterMsg buf[1];
+    uint64_t nread;
+    clusterMsg *hdr;
+    clusterLink *link = connGetPrivateData(conn);
+    unsigned int readlen, rcvbuflen;
+
+    while(1) { /* Read as long as there is data to read. */
+        rcvbuflen = sdslen(link->rcvbuf);
+        if (rcvbuflen < 8) {
+            /* First, obtain the first 8 bytes to get the full message
+             * length. */
+            readlen = 8 - rcvbuflen;
+        } else {
+            /* Finally read the full message. */
+            hdr = (clusterMsg*) link->rcvbuf;
+            if (rcvbuflen == 8) {
+                /* Perform some sanity check on the message signature
+                 * and length. */
+                if (memcmp(hdr->sig,"RCmb",4) != 0 ||
+                    ntohl(hdr->totlen) < CLUSTERMSG_MIN_LEN)
+                {
+                    serverLog(LL_WARNING,
+                        "Bad message length or signature received "
+                        "from Cluster bus.");
+                    handleLinkIOError(link);
+                    return;
+                }
+            }
+            readlen = ntohl(hdr->totlen) - rcvbuflen;
+            if (readlen > sizeof(buf)) readlen = sizeof(buf);
+        }
+
+        // Copying the quic buffer to clustermsg buf object.
+        // TODO: Check if there is any other way to copy the quic buffers.
+        nread = 0;
+        for (uint32_t i = 0; i < bufferCount; ++i) 
+        {
+            memcpy(
+                ((uint8_t*)buf) + nread,
+                buffers[i].Buffer,
+                buffers[i].Length);
+                nread += buffers[i].Length;
+        }
+        if (nread == 0 && (connGetState(conn) == CONN_STATE_CONNECTED)) return; /* No more data ready. */
+
+        // TODO: Be careful on updating flags in conn object.
+
+        // No data is available and conn state is not in connected. So, clearing the link.
+        if (nread == 0) {
+            /* I/O error... */
+            serverLog(LL_DEBUG,"I/O error reading from node link: %s",
+                (nread == 0) ? "connection closed" : connGetLastError(conn));
+            handleLinkIOError(link);
+            return;
+        } else {
+            /* Read data and recast the pointer to the new buffer. */
+            link->rcvbuf = sdscatlen(link->rcvbuf,buf,nread);
+            hdr = (clusterMsg*) link->rcvbuf;
+            rcvbuflen += nread;
+        }
+
+        /* Total length obtained? Process this packet. */
+        if (rcvbuflen >= 8 && rcvbuflen == ntohl(hdr->totlen)) {
+            if (clusterProcessPacket(link)) {
+                sdsfree(link->rcvbuf);
+                link->rcvbuf = sdsempty();
+            } else {
+                return; /* Link no longer valid. */
+            }
+        }
+    }
 }
