@@ -79,10 +79,10 @@ int clusterBumpConfigEpochWithoutConsensus(void);
 void moduleCallClusterReceivers(const char *sender_id, uint64_t module_id, uint8_t type, const unsigned char *payload, uint32_t len);
 
 /* Quic related functions */
-int quicInit(quicHandlers *handlers, int port);
-void closeHandlers(quicHandlers *handlers);
-int initQuicServer(quicHandlers *handlers, int port, QUIC_BUFFER alpn);
-int initQuicClient(quicHandlers *handlers, int port, QUIC_BUFFER alpn);
+int quicInit(int port);
+void closeHandlers();
+int initQuicServer(int port, QUIC_BUFFER alpn);
+int initQuicClient(int port, QUIC_BUFFER alpn);
 
 /* -----------------------------------------------------------------------------
  * Initialization
@@ -456,7 +456,6 @@ void clusterUpdateMyselfFlags(void) {
 }
 
 int initQuicServer(
-    quicHandlers *handlers, 
     int port, 
     QUIC_BUFFER alpn)
 {
@@ -492,22 +491,22 @@ int initQuicServer(
         initialized = 0;
     }
 
-    if (initialized && QUIC_FAILED(status = handlers->msquic->ConfigurationOpen(
-                        handlers->registration, 
+    if (initialized && QUIC_FAILED(status = server.cluster->quic_handlers.msquic->ConfigurationOpen(
+                        server.cluster->quic_handlers.registration, 
                         &alpn, 
                         1, 
                         &settings, 
                         sizeof(settings), 
                         NULL, 
-                        &handlers->server_configuration))) 
+                        &server.cluster->quic_handlers.server_configuration))) 
     {
         printf("ConfigurationOpen failed, 0x%x!\n", status);
         serverLog(LL_WARNING,"Quic server ConfigurationOpen failed.");
         initialized = 0;;
     }
 
-    if (initialized && QUIC_FAILED(status = handlers->msquic->ConfigurationLoadCredential(
-                        handlers->server_configuration, 
+    if (initialized && QUIC_FAILED(status = server.cluster->quic_handlers.msquic->ConfigurationLoadCredential(
+                        server.cluster->quic_handlers.server_configuration, 
                         &config)))
     {
         serverLog(LL_WARNING,"Quic server ConfigurationLoadCredential failed.");
@@ -515,18 +514,18 @@ int initQuicServer(
     }
 
 
-    if (initialized && QUIC_FAILED(status = handlers->msquic->ListenerOpen(
-                        handlers->registration, 
+    if (initialized && QUIC_FAILED(status = server.cluster->quic_handlers.msquic->ListenerOpen(
+                        server.cluster->quic_handlers.registration, 
                         ServerListenerCallback,
                         NULL, 
-                        &handlers->listener))) 
+                        &server.cluster->quic_handlers.listener))) 
     {
         serverLog(LL_WARNING,"Quic server ListenerOpen failed.");
         initialized = 0;;
     }
 
-    if (initialized && QUIC_FAILED(status = handlers->msquic->ListenerStart(
-                        handlers->listener, 
+    if (initialized && QUIC_FAILED(status = server.cluster->quic_handlers.msquic->ListenerStart(
+                        server.cluster->quic_handlers.listener, 
                         &alpn, 
                         1, 
                         &address))) 
@@ -539,7 +538,6 @@ int initQuicServer(
 }
 
 int initQuicClient(
-    quicHandlers *handlers, 
     int port, 
     QUIC_BUFFER alpn)
 {
@@ -560,21 +558,21 @@ int initQuicClient(
     // TODO: Check certification validation required flags.
     cred_config.Flags |= QUIC_CREDENTIAL_FLAG_NO_CERTIFICATE_VALIDATION;
  
-    if (QUIC_FAILED(status = handlers->msquic->ConfigurationOpen(
-                        handlers->registration, 
+    if (QUIC_FAILED(status = server.cluster->quic_handlers.msquic->ConfigurationOpen(
+                        server.cluster->quic_handlers.registration, 
                         &alpn, 
                         1, 
                         &settings, 
                         sizeof(settings), 
                         NULL, 
-                        &handlers->client_configuration))) 
+                        &server.cluster->quic_handlers.client_configuration))) 
     {
         serverLog(LL_WARNING,"Quic client ConfigurationOpen failed.");
         initialized = 0;
     }
 
-    if (initialized && QUIC_FAILED(status = handlers->msquic->ConfigurationLoadCredential(
-                        handlers->client_configuration, 
+    if (initialized && QUIC_FAILED(status = server.cluster->quic_handlers.msquic->ConfigurationLoadCredential(
+                        server.cluster->quic_handlers.client_configuration, 
                         &cred_config))) 
     {
         serverLog(LL_WARNING,"Quic client ConfigurationLoadCredential failed.");
@@ -584,33 +582,33 @@ int initQuicClient(
     return initialized;
 }
 
-void closeHandlers(quicHandlers *handlers)
+void closeHandlers()
 {
-    if (handlers->registration != NULL) 
+    if (server.cluster->quic_handlers.registration != NULL) 
     {
-        handlers->msquic->RegistrationClose(handlers->registration);
+        server.cluster->quic_handlers.msquic->RegistrationClose(server.cluster->quic_handlers.registration);
     }
-    if (handlers->server_configuration != NULL) 
+    if (server.cluster->quic_handlers.server_configuration != NULL) 
     {
-        handlers->msquic->ConfigurationClose(handlers->server_configuration);
+        server.cluster->quic_handlers.msquic->ConfigurationClose(server.cluster->quic_handlers.server_configuration);
     }
-    if (handlers->client_configuration != NULL) 
+    if (server.cluster->quic_handlers.client_configuration != NULL) 
     {
-        handlers->msquic->ConfigurationClose(handlers->client_configuration);
+        server.cluster->quic_handlers.msquic->ConfigurationClose(server.cluster->quic_handlers.client_configuration);
     }
-    if (handlers->listener != NULL) 
+    if (server.cluster->quic_handlers.listener != NULL) 
     {
-        handlers->msquic->ListenerClose(handlers->listener);
+        server.cluster->quic_handlers.msquic->ListenerClose(server.cluster->quic_handlers.listener);
     }
-    MsQuicClose(handlers->msquic);
+    MsQuicClose(server.cluster->quic_handlers.msquic);
 }
 
-int quicInit(quicHandlers *handlers, int port)
+int quicInit(int port)
 {
     QUIC_STATUS status = QUIC_STATUS_SUCCESS;
     int initialized = 1;
     // TODO: Use serverlog function
-    if (QUIC_FAILED(status = MsQuicOpen(&handlers->msquic))) 
+    if (QUIC_FAILED(status = MsQuicOpen(&server.cluster->quic_handlers.msquic))) 
     {
         serverLog(LL_WARNING,"Unable to open MsQuic lib.");
         initialized = 0;
@@ -619,31 +617,32 @@ int quicInit(quicHandlers *handlers, int port)
     QUIC_REGISTRATION_CONFIG reg_config = { "quic_redis", QUIC_EXECUTION_PROFILE_LOW_LATENCY };
     QUIC_BUFFER alpn = { sizeof("sample") - 1, (uint8_t*)"sample" };
     
-    if (initialized && QUIC_FAILED(status = handlers->msquic->RegistrationOpen(
+    if (initialized && QUIC_FAILED(status = server.cluster->quic_handlers.msquic->RegistrationOpen(
                         &reg_config, 
-                        &handlers->registration))) 
+                        &server.cluster->quic_handlers.registration))) 
     {
        serverLog(LL_WARNING,"Quic RegistrationOpen failed.");
        initialized = 0;
     }
 
-    if (initialized && !initQuicServer(handlers, port, alpn))
+    if (initialized && !initQuicServer(port, alpn))
     {
         serverLog(LL_WARNING,"QUIC server initialization failed.");
         initialized = 0;
     }
 
-    if (initialized && !initQuicClient(handlers, port, alpn))
+    if (initialized && !initQuicClient(port, alpn))
     {
         serverLog(LL_WARNING,"QUIC client initialization failed.");
         initialized = 0;
     }
 
-    if (!initialized && handlers->msquic != NULL) 
+    if (!initialized && server.cluster->quic_handlers.msquic != NULL) 
     {
-        closeHandlers(handlers);
+        closeHandlers();
     }
 
+    serverLog(LL_NOTICE,"QUIC initialization succeeded %d.", initialized);
     return initialized;
 }
 
@@ -708,11 +707,14 @@ void clusterInit(void) {
         exit(1);
     }
 
-    server.cluster->quic_handlers = zmalloc(sizeof(quicHandlers));
-    if(server.quic_config.quic_enabled && !quicInit(server.cluster->quic_handlers, port))
+    // server.cluster->quic_handlers = zmalloc(sizeof(quicHandlers));
+    if(server.quic_config.quic_enabled)
     {
-        serverLog(LL_WARNING, "Unable to initialize QUIC listener.");
-        exit(1);
+        if (!quicInit(port))
+        {
+            serverLog(LL_WARNING, "Unable to initialize QUIC listener.");
+            exit(1);
+        }
     }
     else if (listenToPort(port+CLUSTER_PORT_INCR,
         server.cfd,&server.cfd_count) == C_ERR)
