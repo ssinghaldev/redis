@@ -42,8 +42,6 @@
 #include <sys/file.h>
 #include <math.h>
 
-#include "msquic.h"
-
 /* A global reference to myself is handy to make code more clear.
  * Myself always points to server.cluster->myself, that is, the clusterNode
  * that represents this node. */
@@ -85,6 +83,9 @@ int quicInit(int port);
 void closeHandlers();
 int initQuicServer(int port, QUIC_BUFFER alpn);
 int initQuicClient(int port, QUIC_BUFFER alpn);
+QUIC_STATUS serverListenerCallBack(HQUIC listener, void* context, QUIC_LISTENER_EVENT* Event);
+QUIC_STATUS serverConnectionCallBack(HQUIC Connection, void *Context, QUIC_CONNECTION_EVENT *Event);
+QUIC_STATUS serverStreamCallBack(HQUIC Stream, void *Context, QUIC_STREAM_EVENT *Event);
 
 /* -----------------------------------------------------------------------------
  * Initialization
@@ -502,9 +503,8 @@ int initQuicServer(
                         NULL, 
                         &server.cluster->quic_handlers.server_configuration))) 
     {
-        printf("ConfigurationOpen failed, 0x%x!\n", status);
         serverLog(LL_WARNING,"Quic server ConfigurationOpen failed.");
-        initialized = 0;;
+        initialized = 0;
     }
 
     if (initialized && QUIC_FAILED(status = server.cluster->quic_handlers.msquic->ConfigurationLoadCredential(
@@ -518,7 +518,7 @@ int initQuicServer(
 
     if (initialized && QUIC_FAILED(status = server.cluster->quic_handlers.msquic->ListenerOpen(
                         server.cluster->quic_handlers.registration, 
-                        ServerListenerCallback,
+                        serverListenerCallBack,
                         NULL, 
                         &server.cluster->quic_handlers.listener))) 
     {
@@ -6103,18 +6103,25 @@ QUIC_STATUS serverListenerCallBack(HQUIC Listener, void *Context, QUIC_LISTENER_
 
     switch (Event->Type) {
         case QUIC_LISTENER_EVENT_NEW_CONNECTION:
+        {
             //DOUBT: Set the Confiuration of connection - Have to understand why we are doing it?
             //TODO: What if the status is not good?? We should not create CONN object or set it to a bad state
-            Status = MsQuic->ConnectionSetConfiguration(Event->NEW_CONNECTION.Connection, Configuration);
+            Status = server.cluster->quic_handlers.msquic->ConnectionSetConfiguration(
+                Event->NEW_CONNECTION.Connection, 
+                server.cluster->quic_handlers.server_configuration);
 
             /* Create the quic_connection object */
-            quic_connection *conn = zcalloc(sizeof(quic_connection))
+            quicConnection *conn = zcalloc(sizeof(quicConnection));
             //TODO: Have to properly initialize various things once we integrate
 
             /* Set CallBackHandler */
-            MsQuic->SetCallbackHandler(Event->NEW_CONNECTION.Connection, (void*)serverConnectionCallback, (void*)conn);
+            server.cluster->quic_handlers.msquic->SetCallbackHandler(
+                Event->NEW_CONNECTION.Connection, 
+                (void*)serverConnectionCallBack, 
+                (void*)conn);
 
             break;
+        }
         default:
             break;
     }
@@ -6126,37 +6133,43 @@ QUIC_STATUS serverListenerCallBack(HQUIC Listener, void *Context, QUIC_LISTENER_
 /* This func is the callback handler for various connections events that are fired by MsQUIC */
 QUIC_STATUS serverConnectionCallBack(HQUIC Connection, void *Context, QUIC_CONNECTION_EVENT *Event){
     //Get the connection object from Context
-    connection *conn = (connection*)Context;
+    quicConnection *conn = (quicConnection*)Context;
 
     switch (Event->Type) {
         case QUIC_CONNECTION_EVENT_CONNECTED:
+        {
             /* create the cluster link for the connection*/
             clusterLink *link = createClusterLink(NULL);
             
             //DOUBT: There might be a problem typecasting. Have to see when compiling
-            link->conn = conn
-            connSetPrivateData(conn, link);
+            link->conn = conn;
+            connSetPrivateData(&conn->conn, link);
 
             //TODO: Might have to set some statuses/flags (Redis/QUIC specififc). Will see later
             break;
+        }
         case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT:
         case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_PEER:
         case QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE:
+        {
             /* Get clusterLink associated with the connection to free which will close the conenction obj too
              * Hopefully, the connection object which was modified in QUIC_CONNECTION_EVENT_CONNECTED 
              * is passed. If not, we are in big trouble as we have to find a hack to store connections/links */
-            clusterLink* link = (clusterLink*)connGetPrivateData(conn);
+            clusterLink* link = (clusterLink*)connGetPrivateData(&conn->conn);
             if (link) {
                 freeClusterLink(link);
             }
             //TODO: Mostly likely our implementation of connClose should take care of addiitonal flags and such
             break;
+        }
         case QUIC_CONNECTION_EVENT_PEER_STREAM_STARTED:
+        {
             //TODO: Not sure what else could be done at this point
             //Should we store something in connection regarding current streams running??
             //We can also store the data/flags we receive from MsQUIC event if we end up using it somehow
-            MsQuic->SetCallbackHandler(Event->PEER_STREAM_STARTED.Stream, (void*)serverStreamCallback, (void*)conn);
+            server.cluster->quic_handlers.msquic->SetCallbackHandler(Event->PEER_STREAM_STARTED.Stream, (void*)serverStreamCallBack, (void*)conn);
             break;
+        }
         default:
             /* We are not capturing other events */
             //TOOD: Can probably log what other events are receiving for debugging purposes!
@@ -6168,7 +6181,7 @@ QUIC_STATUS serverConnectionCallBack(HQUIC Connection, void *Context, QUIC_CONNE
 
 QUIC_STATUS serverStreamCallBack(HQUIC Stream, void *Context, QUIC_STREAM_EVENT *Event){
     //Get the connection object from Context
-    connection *conn = (connection*)Context;
+    quicConnection *conn = (quicConnection*)Context;
 
     switch (Event->Type) {
     }
