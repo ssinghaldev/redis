@@ -187,7 +187,7 @@ typedef struct clusterState {
     long long stats_bus_messages_received[CLUSTERMSG_TYPE_COUNT];
     long long stats_pfail_nodes;    /* Number of nodes in PFAIL status,
                                        excluding nodes without address. */
-    quicHandlers *quic_handlers;
+    quicHandlers quic_handlers;
 } clusterState;
 
 /* Redis cluster messages header */
