@@ -41,6 +41,8 @@
 #include <sys/file.h>
 #include <math.h>
 
+#include "msquic.h"
+
 /* A global reference to myself is handy to make code more clear.
  * Myself always points to server.cluster->myself, that is, the clusterNode
  * that represents this node. */
@@ -5883,4 +5885,34 @@ int clusterRedirectBlockedClientIfNeeded(client *c) {
         dictReleaseIterator(di);
     }
     return 0;
+}
+
+/* This func is the callback handler when new connection on a clusterBus comes 
+ * to this node. The listener will get the connection and give to this function. */
+QUIC_STATUS serverListenerCallBack(HQUIC Listener, void *Context, QUIC_LISTENER_EVENT *Event){
+    /* TODO: Mostly taken from sample.cpp Have to change once merging into Nitish branch*/
+    QUIC_STATUS Status = QUIC_STATUS_NOT_SUPPORTED;
+    
+    switch (Event->Type) {
+        case QUIC_LISTENER_EVENT_NEW_CONNECTION:
+            //DOUBT: Set the Confiuration of connection - Have to understand why we are doing it?
+            //TODO: What if the status is not good?? We should not create CONN object or set it to a bad state
+            Status = MsQuic->ConnectionSetConfiguration(Event->NEW_CONNECTION.Connection, Configuration);
+
+            //Create the quic_connection object
+            quic_connection *conn = zcalloc(sizeof(quic_connection))
+            //TODO: Have to properly initialize various things once we integrate
+
+            //Set CallBackHandler 
+            MsQuic->SetCallbackHandler(Event->NEW_CONNECTION.Connection, (void*)serverConnectionCallback, (void*)conn);
+
+            break;
+        default:
+            break;
+    }
+    return Status;
+}
+
+void serverConnectionCallBack(){
+
 }
