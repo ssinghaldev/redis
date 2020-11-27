@@ -5892,27 +5892,78 @@ int clusterRedirectBlockedClientIfNeeded(client *c) {
 QUIC_STATUS serverListenerCallBack(HQUIC Listener, void *Context, QUIC_LISTENER_EVENT *Event){
     /* TODO: Mostly taken from sample.cpp Have to change once merging into Nitish branch*/
     QUIC_STATUS Status = QUIC_STATUS_NOT_SUPPORTED;
-    
+
     switch (Event->Type) {
         case QUIC_LISTENER_EVENT_NEW_CONNECTION:
             //DOUBT: Set the Confiuration of connection - Have to understand why we are doing it?
             //TODO: What if the status is not good?? We should not create CONN object or set it to a bad state
             Status = MsQuic->ConnectionSetConfiguration(Event->NEW_CONNECTION.Connection, Configuration);
 
-            //Create the quic_connection object
+            /* Create the quic_connection object */
             quic_connection *conn = zcalloc(sizeof(quic_connection))
             //TODO: Have to properly initialize various things once we integrate
 
-            //Set CallBackHandler 
+            /* Set CallBackHandler */
             MsQuic->SetCallbackHandler(Event->NEW_CONNECTION.Connection, (void*)serverConnectionCallback, (void*)conn);
 
             break;
         default:
             break;
     }
+
+    //DOUBT: Not sure if are using this status elsewhere as the libray calls this function
     return Status;
 }
 
-void serverConnectionCallBack(){
+/* This func is the callback handler for various connections events that are fired by MsQUIC */
+QUIC_STATUS serverConnectionCallBack(HQUIC Connection, void *Context, QUIC_CONNECTION_EVENT *Event){
+    //Get the connection object from Context
+    connection *conn = (connection*)Context;
 
+    switch (Event->Type) {
+        case QUIC_CONNECTION_EVENT_CONNECTED:
+            /* create the cluster link for the connection*/
+            clusterLink *link = createClusterLink(NULL);
+            
+            //DOUBT: There might be a problem typecasting. Have to see when compiling
+            link->conn = conn
+            connSetPrivateData(conn, link);
+
+            //TODO: Might have to set some statuses/flags (Redis/QUIC specififc). Will see later
+            break;
+        case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT:
+        case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_PEER:
+        case QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE:
+            /* Get clusterLink associated with the connection to free which will close the conenction obj too
+             * Hopefully, the connection object which was modified in QUIC_CONNECTION_EVENT_CONNECTED 
+             * is passed. If not, we are in big trouble as we have to find a hack to store connections/links */
+            clusterLink* link = (clusterLink*)connGetPrivateData(conn);
+            if (link) {
+                freeClusterLink(link);
+            }
+            //TODO: Mostly likely our implementation of connClose should take care of addiitonal flags and such
+            break;
+        case QUIC_CONNECTION_EVENT_PEER_STREAM_STARTED:
+            //TODO: Not sure what else could be done at this point
+            //Should we store something in connection regarding current streams running??
+            //We can also store the data/flags we receive from MsQUIC event if we end up using it somehow
+            MsQuic->SetCallbackHandler(Event->PEER_STREAM_STARTED.Stream, (void*)serverStreamCallback, (void*)conn);
+            break;
+        default:
+            /* We are not capturing other events */
+            //TOOD: Can probably log what other events are receiving for debugging purposes!
+            break;
+    }
+
+    return QUIC_STATUS_SUCCESS;
+}
+
+QUIC_STATUS serverStreamCallBack(HQUIC Stream, void *Context, QUIC_STREAM_EVENT *Event){
+    //Get the connection object from Context
+    connection *conn = (connection*)Context;
+
+    switch (Event->Type) {
+    }
+
+    return QUIC_STATUS_SUCCESS;
 }
