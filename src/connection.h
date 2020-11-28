@@ -50,6 +50,7 @@ typedef enum {
 
 #define CONN_TYPE_SOCKET            1
 #define CONN_TYPE_TLS               2
+#define CONN_TYPE_QUIC              3
 
 typedef void (*ConnectionCallbackFunc)(struct connection *conn);
 

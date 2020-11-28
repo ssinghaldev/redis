@@ -6181,7 +6181,8 @@ QUIC_STATUS serverConnectionCallBack(HQUIC Connection, void *Context, QUIC_CONNE
     return QUIC_STATUS_SUCCESS;
 }
 
-QUIC_STATUS serverStreamCallBack(HQUIC Stream, void *Context, QUIC_STREAM_EVENT *Event){
+QUIC_STATUS serverStreamCallBack(HQUIC Stream, void *Context, QUIC_STREAM_EVENT *Event)
+{
     //Get the connection object from Context
     quicConnection *conn = (quicConnection*)Context;
 
