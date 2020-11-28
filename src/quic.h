@@ -54,7 +54,8 @@ static void connQuicClose(connection *conn)
     zfree(quic_conn);
 }
 
-static const char *connSocketGetLastError(connection *conn) 
+// TODO: Point it to Quic error status instead of conn last error.
+static const char *connQuicGetLastError(connection *conn) 
 {
     quicConnection *quic_conn = (quicConnection *) conn;
     return strerror(quic_conn->conn.last_errno);
@@ -72,7 +73,7 @@ ConnectionType CT_QUIC = {
     .connect = connQuicConnect,
     .write = connQuicWrite,
     .close = connQuicClose,
-    .get_last_error = connSocketGetLastError,
+    .get_last_error = connQuicGetLastError,
     .get_type = connQuicGetType
 };
 
