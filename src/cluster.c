@@ -86,7 +86,7 @@ int initQuicClient(int port, QUIC_BUFFER alpn);
 QUIC_STATUS serverListenerCallBack(HQUIC listener, void* context, QUIC_LISTENER_EVENT* Event);
 QUIC_STATUS serverConnectionCallBack(HQUIC Connection, void *Context, QUIC_CONNECTION_EVENT *Event);
 QUIC_STATUS serverStreamCallBack(HQUIC Stream, void *Context, QUIC_STREAM_EVENT *Event);
-void serverStreamReadHandler(quicConnection *context, QUIC_BUFFER* buffers, uint32_t bufferCount); 
+void serverStreamReadHandler(HQUIC Stream, quicConnection *Context, QUIC_STREAM_EVENT *Event); 
 
 /* -----------------------------------------------------------------------------
  * Initialization
@@ -4529,6 +4529,7 @@ void clusterCommand(client *c) {
         return;
     }
 
+    serverLog(LL_NOTICE, "command received: %s", c->argv[1]->ptr);
     if (c->argc == 2 && !strcasecmp(c->argv[1]->ptr,"help")) {
         const char *help[] = {
 "ADDSLOTS <slot> [slot ...] -- Assign slots to current node.",
@@ -6197,7 +6198,31 @@ QUIC_STATUS serverStreamCallBack(HQUIC Stream, void *Context, QUIC_STREAM_EVENT 
         case QUIC_STREAM_EVENT_RECEIVE:
         {
             serverLog(LL_NOTICE,"Server received stream event receive.");
-            serverStreamReadHandler(Context, Event->RECEIVE.Buffers, Event->RECEIVE.BufferCount);
+
+            /* Checking if the received stream data containing header,
+            *  if not informing the MsQuic library that no data has consumed and 
+            *  setting receive enabled flag, inorder to receive the data from 
+            *  first byte in the next event.*/
+            if (Event->RECEIVE.TotalBufferLength <= 8)
+            {
+                Event->RECEIVE.TotalBufferLength = 0;
+
+                /* Removing the cluster link if we are unable to set receive 
+                *  enabled flag. As MsQuic blocks sending data to app incase 
+                *  of entire data not consumed. */
+                QUIC_STATUS status;
+                if(QUIC_FAILED(status = server.cluster->quic_handlers.msquic->StreamReceiveSetEnabled(
+                        Stream,
+                        true)))
+                {
+                    serverLog(LL_WARNING,"MsQuic stream receive set enabled failed and removing link.");
+                    handleLinkIOError(link);
+                }
+            }
+            else
+            {
+                serverStreamReadHandler(Stream, Context, Event);
+            }
             break;
         }
         case QUIC_STREAM_EVENT_SEND_COMPLETE:
@@ -6228,6 +6253,8 @@ QUIC_STATUS serverStreamCallBack(HQUIC Stream, void *Context, QUIC_STREAM_EVENT 
         case QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE:
         {
             serverLog(LL_NOTICE,"Server received stream event shutdown complete.");
+            /* Closing the stream.*/
+            server.cluster->quic_handlers.msquic->StreamClose(Stream);
             break;
         }
         case QUIC_STREAM_EVENT_IDEAL_SEND_BUFFER_SIZE:
@@ -6243,81 +6270,71 @@ QUIC_STATUS serverStreamCallBack(HQUIC Stream, void *Context, QUIC_STREAM_EVENT 
 /* Read data. Try to read the first field of the header first to check the
  * full length of the packet. When a whole packet is in memory this function
  * will call the function to process the packet. And so forth. */
-void serverStreamReadHandler(
-    quicConnection *context,
-    QUIC_BUFFER* buffers, 
-    uint32_t bufferCount) 
+void serverStreamReadHandler(HQUIC Stream, quicConnection *Context, QUIC_STREAM_EVENT *Event) 
 {
-    connection *conn = &context->conn;
+    connection *conn = &Context->conn;
     clusterMsg buf[1];
     uint64_t nread;
-    clusterMsg *hdr;
     clusterLink *link = connGetPrivateData(conn);
-    unsigned int readlen, rcvbuflen;
 
-    while(1) { /* Read as long as there is data to read. */
-        rcvbuflen = sdslen(link->rcvbuf);
-        if (rcvbuflen < 8) {
-            /* First, obtain the first 8 bytes to get the full message
-             * length. */
-            readlen = 8 - rcvbuflen;
-        } else {
-            /* Finally read the full message. */
-            hdr = (clusterMsg*) link->rcvbuf;
-            if (rcvbuflen == 8) {
-                /* Perform some sanity check on the message signature
-                 * and length. */
-                if (memcmp(hdr->sig,"RCmb",4) != 0 ||
-                    ntohl(hdr->totlen) < CLUSTERMSG_MIN_LEN)
-                {
-                    serverLog(LL_WARNING,
-                        "Bad message length or signature received "
-                        "from Cluster bus.");
-                    handleLinkIOError(link);
-                    return;
-                }
-            }
-            readlen = ntohl(hdr->totlen) - rcvbuflen;
-            if (readlen > sizeof(buf)) readlen = sizeof(buf);
-        }
+    // Copying the quic buffer to clustermsg buf object.
+    nread = 0;
+    int headerChecked = 0;
+    for (uint32_t i = 0; i < Event->RECEIVE.BufferCount; ++i) 
+    {
+        memcpy(
+            ((uint8_t*)buf) + nread,
+            Event->RECEIVE.Buffers[i].Buffer,
+            Event->RECEIVE.Buffers[i].Length);
+            nread += Event->RECEIVE.Buffers[i].Length;
 
-        // Copying the quic buffer to clustermsg buf object.
-        // TODO: Check if there is any other way to copy the quic buffers.
-        nread = 0;
-        for (uint32_t i = 0; i < bufferCount; ++i) 
+        /* Checking if the data contains the entire the clusterMsg.
+        *  If not informing the MsQuic library that no data has been consumed.*/
+        if (nread >= 8 && !headerChecked)
         {
-            memcpy(
-                ((uint8_t*)buf) + nread,
-                buffers[i].Buffer,
-                buffers[i].Length);
-                nread += buffers[i].Length;
-        }
-        if (nread == 0 && (connGetState(conn) == CONN_STATE_CONNECTED)) return; /* No more data ready. */
-
-        // TODO: Be careful on updating flags in conn object.
-
-        // No data is available and conn state is not in connected. So, clearing the link.
-        if (nread == 0) {
-            /* I/O error... */
-            serverLog(LL_DEBUG,"I/O error reading from node link: %s",
-                (nread == 0) ? "connection closed" : connGetLastError(conn));
-            handleLinkIOError(link);
-            return;
-        } else {
-            /* Read data and recast the pointer to the new buffer. */
-            link->rcvbuf = sdscatlen(link->rcvbuf,buf,nread);
-            hdr = (clusterMsg*) link->rcvbuf;
-            rcvbuflen += nread;
-        }
-
-        /* Total length obtained? Process this packet. */
-        if (rcvbuflen >= 8 && rcvbuflen == ntohl(hdr->totlen)) {
-            if (clusterProcessPacket(link)) {
-                sdsfree(link->rcvbuf);
-                link->rcvbuf = sdsempty();
-            } else {
-                return; /* Link no longer valid. */
+            /* Perform some sanity check on the message signature
+            * and length. */
+            uint32_t msg_len = ntohl(buf[0].totlen);
+            if (memcmp(buf[0].sig,"RCmb",4) != 0 ||
+                msg_len < CLUSTERMSG_MIN_LEN)
+            {
+                serverLog(LL_WARNING,
+                    "Bad message length or signature received "
+                    "from Cluster bus.");
+                handleLinkIOError(link);
+                return;
             }
+
+            /* The entire message is not present in the currect quic 
+            *  stream buffer. */
+            if(msg_len != Event->RECEIVE.TotalBufferLength)
+            {
+                Event->RECEIVE.TotalBufferLength = 0;
+
+                /* Removing the cluster link if we are unable to set receive 
+                *  enabled flag. As MsQuic blocks sending data to app incase 
+                *  of entire data not consumed. */
+                QUIC_STATUS status;
+                if(QUIC_FAILED(status = 
+                    server.cluster->quic_handlers.msquic->StreamReceiveSetEnabled(
+                        Stream,
+                        true)))
+                {
+                    serverLog(LL_WARNING,"MsQuic stream receive set enabled failed and removing link.");
+                    handleLinkIOError(link);
+                }
+
+                return;
+            }
+            headerChecked = 1;
         }
     }
+    
+    /* Read data and recast the pointer to the new buffer. */
+    link->rcvbuf = sdscatlen(link->rcvbuf,buf, sizeof(buf));
+
+    clusterProcessPacket(link);
+    sdsfree(link->rcvbuf);
+    link->rcvbuf = sdsempty();
+    return;
 }
