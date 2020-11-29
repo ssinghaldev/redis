@@ -15,7 +15,7 @@ typedef struct quicConnection
 ConnectionType CT_QUIC;
 
 // TODO: Move all functions to quic.c file
-quicConnection *connCreateQuic(void) 
+connection *connCreateQuic(void)
 {
     quicConnection *quic_conn = zcalloc(sizeof(quicConnection));
     quic_conn->conn.fd = -1;

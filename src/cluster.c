@@ -3729,6 +3729,13 @@ void clusterCron(void) {
         }
 
         if (node->link == NULL) {
+            if (server.quic_config.quic_enabled) {
+                /* This will take care of connection*/
+                quicConnect(node);
+                continue;
+            }
+
+            /* If not QUIC, then normal functionality*/
             clusterLink *link = createClusterLink(node);
             link->conn = server.tls_cluster ? connCreateTLS() : connCreateSocket();
             connSetPrivateData(link->conn, link);
@@ -6113,6 +6120,7 @@ QUIC_STATUS serverListenerCallBack(HQUIC Listener, void *Context, QUIC_LISTENER_
                 server.cluster->quic_handlers.server_configuration);
 
             /* Create the quic_connection object */
+            //TODO: change it to the method we created in quic.h
             quicConnection *conn = zcalloc(sizeof(quicConnection));
             //TODO: Have to properly initialize various things once we integrate
 
@@ -6329,7 +6337,7 @@ void serverStreamReadHandler(HQUIC Stream, quicConnection *Context, QUIC_STREAM_
             headerChecked = 1;
         }
     }
-    
+   
     /* Read data and recast the pointer to the new buffer. */
     link->rcvbuf = sdscatlen(link->rcvbuf,buf, sizeof(buf));
 
@@ -6337,4 +6345,123 @@ void serverStreamReadHandler(HQUIC Stream, quicConnection *Context, QUIC_STREAM_
     sdsfree(link->rcvbuf);
     link->rcvbuf = sdsempty();
     return;
+}
+
+/* This func is the callback handler for various client connections events that are fired by MsQUIC */
+QUIC_STATUS clientConnectionCallBack(HQUIC Connection, void *Context, QUIC_CONNECTION_EVENT *Event){
+    //Get the node object from Context
+    clusterNode *node = (clusterNode*)Context;
+
+    switch (Event->Type) {
+        case QUIC_CONNECTION_EVENT_CONNECTED:
+        {
+            /* create the cluster link for the connection*/
+            clusterLink *link = createClusterLink(node);
+            
+            /* Create the connection obj & associate with the link
+             * Also update the private data of connection and 
+             * update the link in node*/
+            connection *conn = connCreateAcceptedQuic(Connection);            
+            link->conn = conn;
+            connSetPrivateData(conn, link);
+            node->link = link;
+
+            /* ---------Replicating functionality of clusterLinkConnectHandler ---------- */
+            
+            /* Queue a PING in the new connection ASAP: this is crucial
+            * to avoid false positives in failure detection.
+            *
+            * If the node is flagged as MEET, we send a MEET message instead
+            * of a PING one, to force the receiver to add us in its node
+            * table. */
+            mstime_t old_ping_sent = node->ping_sent;
+            clusterSendPing(link, node->flags & CLUSTER_NODE_MEET ?
+                    CLUSTERMSG_TYPE_MEET : CLUSTERMSG_TYPE_PING);
+            if (old_ping_sent) {
+                /* If there was an active ping before the link was
+                * disconnected, we want to restore the ping time, otherwise
+                * replaced by the clusterSendPing() call. */
+                node->ping_sent = old_ping_sent;
+            }
+            /* We can clear the flag after the first packet is sent.
+            * If we'll never receive a PONG, we'll never send new packets
+            * to this node. Instead after the PONG is received and we
+            * are no longer in meet/handshake status, we want to send
+            * normal PING packets. */
+            node->flags &= ~CLUSTER_NODE_MEET;
+
+            serverLog(LL_NOTICE,"Connecting with Node %.40s at %s:%d",
+                    node->name, node->ip, node->cport);
+            
+            break;
+        }
+        case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT:
+        case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_PEER:
+        case QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE:
+        {
+            /* Get clusterLink associated with the connection to free which will close the conenction obj too
+             * Hopefully, the connection object which was modified in QUIC_CONNECTION_EVENT_CONNECTED 
+             * is passed. If not, we are in big trouble as we have to find a hack to store connections/links */
+            clusterLink* link = (clusterLink*)node->link;
+            if (link) {
+                freeClusterLink(link);
+            }
+            //TODO: Mostly likely our implementation of connClose should take care of addiitonal flags and such
+            break;
+        }
+        case QUIC_CONNECTION_EVENT_PEER_STREAM_STARTED:
+        {
+            /* In order to pass connection obj to StreamCallBackHandler, we need 
+             * to extract it from the link which is present in the node passed to
+             * this function via context.
+             * 
+             * This node is populated with link & link is populated with conn on
+             * QUIC_CONNECTION_EVENT_CONNECTED event handled above*/
+
+            //TODO: error check node->link->conn before assigning as it might be NULL
+            // One option is to free the link if conn obj is not present so that
+            // clusterCron will try to reconnect
+            connection* conn = node->link->conn;
+            server.cluster->quic_handlers.msquic->SetCallbackHandler(Event->PEER_STREAM_STARTED.Stream, (void*)serverStreamCallBack, (void*)conn);
+            break;
+        }
+        default:
+            /* We are not capturing other events */
+            //TOOD: Can probably log what other events are receiving for debugging purposes!
+            break;
+    }
+
+    return QUIC_STATUS_SUCCESS;
+}
+
+void quicConnect(clusterNode* node){
+    QUIC_STATUS Status;
+    HQUIC Connection = NULL;
+
+    /* Open new Connection*/
+    if (QUIC_FAILED(Status = server.cluster->quic_handlers.msquic->ConnectionOpen(
+                                                    server.cluster->quic_handlers.registration, 
+                                                    clientConnectionCallback, 
+                                                    node, &Connection))) {
+        serverLog(LL_NOTICE, "MsQUIC ConnectionOpen failed, 0x%x for Cluster Node [%s]:%d\n", 
+                Status, node->ip, node->cport);
+        
+        if (node->ping_sent == 0) node->ping_sent = mstime();
+        return;
+    }
+
+    /* Start the connection*/
+    if (QUIC_FAILED(Status = server.cluster->quic_handlers.msquic->ConnectionStart(
+                                                    Connection, 
+                                                    server.cluster->quic_handlers.client_configuration, 
+                                                    QUIC_ADDRESS_FAMILY_UNSPEC,
+                                                    node->ip, 
+                                                    node->cport))) {
+        serverLog(LL_NOTICE, "MsQUIC ConnectionStart failed, 0x%x for Cluster Node [%s]:%d\n", 
+                            Status, node->ip, node->cport);
+
+        if (node->ping_sent == 0) node->ping_sent = mstime();
+        server.cluster->quic_handlers.msquic->ConnectionClose(Connection);
+        return;
+    }
 }
