@@ -13,7 +13,7 @@ typedef struct quicConnection {
 } quicConnection;
 
 // TODO: Move all functions to quic.c file
-connection *connCreateQuic(void) {
+connection *connCreateQuicSocket(void) {
     quicConnection *quic_conn = zcalloc(sizeof(quicConnection));
     quic_conn->conn.fd = -1;
     quic_conn->conn.type = &CT_QUIC;
@@ -23,7 +23,7 @@ connection *connCreateQuic(void) {
 
 connection *connCreateAcceptedQuic(HQUIC quic_connection)
 {
-    quicConnection *quic_conn = (quicConnection *) connCreateQuic();
+    quicConnection *quic_conn = (quicConnection *) connCreateQuicSocket();
     quic_conn->quic_conn_handle = quic_connection;
     quic_conn->conn.state = CONN_STATE_ACCEPTING;
     return (connection *) quic_conn;
@@ -34,14 +34,21 @@ static void connQuicClose(connection *conn) {
     quicConnection *quic_conn = (quicConnection *) conn;
     QUIC_STATUS Status;
 
-    if(quic_conn->quic_conn_handle){
-        if(QUIC_FAILED(Status = server.cluster->quic_handlers.msquic->ConnectionShutDown(
-                                quic_conn->quic_conn_handle,
-                                QUIC_CONNECTION_SHUTDOWN_FLAG_NONE,
-                                0))){
-            serverLog(LL_WARNING, "Unable to shutdown the connection 0x%x!\n", Status);
-        }
+    if (!quic_conn) {
+        serverLog(LL_WARNING, "Closing request for NULL quic connection obj");
+        return;
     }
+
+    /* Dont have to close Msquic connection*/
+    if (!(quic_conn->quic_conn_handle)) {
+        zfree(quic_conn);
+        return;
+    }
+
+    server.cluster->quic_handlers.msquic->ConnectionShutdown(
+                            quic_conn->quic_conn_handle,
+                            QUIC_CONNECTION_SHUTDOWN_FLAG_NONE,
+                            0);
 }
 
 // TODO: Design what should we do when there are errors during connections/stream
