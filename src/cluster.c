@@ -2552,10 +2552,14 @@ void clusterReadHandler(connection *conn) {
  * the link to be invalidated, so it is safe to call this function
  * from event handlers that will do stuff with the same link later. */
 void clusterSendMessage(clusterLink *link, unsigned char *msg, size_t msglen) {
-    if (sdslen(link->sndbuf) == 0 && msglen != 0)
-        connSetWriteHandlerWithBarrier(link->conn, clusterWriteHandler, 1);
-
-    link->sndbuf = sdscatlen(link->sndbuf, msg, msglen);
+    if (server.quic_config.quic_enabled){
+        quicSendMessage(link, msg, msglen);
+    } else {
+        if (sdslen(link->sndbuf) == 0 && msglen != 0)
+                connSetWriteHandlerWithBarrier(link->conn, clusterWriteHandler, 1);
+        
+        link->sndbuf = sdscatlen(link->sndbuf, msg, msglen);
+    }
 
     /* Populate sent messages stats. */
     clusterMsg *hdr = (clusterMsg*) msg;
@@ -6235,6 +6239,10 @@ QUIC_STATUS serverStreamCallBack(HQUIC Stream, void *Context, QUIC_STREAM_EVENT 
         }
         case QUIC_STREAM_EVENT_SEND_COMPLETE:
         {
+            /* Freeing the Buffer allocated 
+             * MSquic just copies the buffer app gave and fires this event
+             * App is responsible for clearing any buffer allocated */
+            zfree(Event->SEND_COMPLETE.ClientContext);
             serverLog(LL_NOTICE,"Server received stream send event complete.");
             break;
         }
@@ -6463,5 +6471,59 @@ void quicConnect(clusterNode* node){
         if (node->ping_sent == 0) node->ping_sent = mstime();
         server.cluster->quic_handlers.msquic->ConnectionClose(Connection);
         return;
+    }
+}
+
+void quicSendMessage(clusterLink *link, unsigned char *msg, size_t msglen){
+    quicConnection* conn = (quicConnection*) link->conn;
+
+    QUIC_STATUS Status;
+    HQUIC Stream = NULL;
+    uint8_t* SendBufferRaw;
+    QUIC_BUFFER* SendBuffer;
+
+    //TODO: change the name of quic connection
+    /* Create a unidirectional stream to send the packet*/
+    if (QUIC_FAILED(Status = server.cluster->quic_handlers.msquic->StreamOpen(
+                            conn->quic, 
+                            QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL, 
+                            serverStreamCallback, 
+                            conn, 
+                            &Stream))) {
+        
+        serverLog(LL_NOTICE, "StreamOpen failed, 0x%x!\n", Status);
+        return;
+        //TODO: check what is happening when connWrite fails
+    }
+
+    /* Start the stream */
+    if (QUIC_FAILED(Status = server.cluster->quic_handlers.msquic->StreamStart(
+                                    Stream, 
+                                    QUIC_STREAM_START_FLAG_NONE))) {
+        serverLog(LL_NOTICE, "StreamStart failed, 0x%x!\n", Status);
+        server.cluster->quic_handlers.msquic->StreamClose(Stream);
+        return;
+        //TODO: check what is happening when connWrite fails
+    }
+
+    /* Allocate & copy the Buffer*/
+    SendBufferRaw = (uint8_t*)zmalloc(sizeof(QUIC_BUFFER) + msglen);
+    
+    SendBuffer = (QUIC_BUFFER*)SendBufferRaw;
+    SendBuffer->Buffer = SendBufferRaw + sizeof(QUIC_BUFFER);
+    SendBuffer->Length = msglen;
+    
+    /* Copy the Buffer */
+    memcpy(SendBuffer->Buffer, msg, msglen);
+
+    /* Send the data and shutdown the stream by sending the FIN FLAG*/
+    if (QUIC_FAILED(Status = server.cluster->quic_handlers.msquic->StreamSend(Stream, 
+                                                SendBuffer, 
+                                                1, //Buffer Count
+                                                QUIC_SEND_FLAG_FIN, 
+                                                SendBuffer))) {
+        serverLog(LL_NOTICE, "StreamSend failed, 0x%x!\n", Status);
+        zfree(SendBufferRaw);
+        //TODO: check what is happening when connWrite fails
     }
 }
