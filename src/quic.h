@@ -5,56 +5,46 @@
 #include "connhelpers.h"
 #include "server.h"
 
-typedef struct quicConnection
-{
-    connection conn;
-    HQUIC quic;
-    QUIC_NEW_CONNECTION_INFO info;   
-}quicConnection;
-
 ConnectionType CT_QUIC;
 
+typedef struct quicConnection {
+    connection conn;
+    HQUIC quic_conn_handle;
+} quicConnection;
+
 // TODO: Move all functions to quic.c file
-connection *connCreateQuic(void)
-{
+connection *connCreateQuic(void) {
     quicConnection *quic_conn = zcalloc(sizeof(quicConnection));
     quic_conn->conn.fd = -1;
     quic_conn->conn.type = &CT_QUIC;
+    quic_conn->quic_conn_handle = NULL;
     return (connection *) quic_conn;
 }
 
-connection *connCreateAcceptedQuic(HQUIC quic_connection, QUIC_NEW_CONNECTION_INFO *info)
+connection *connCreateAcceptedQuic(HQUIC quic_connection)
 {
     quicConnection *quic_conn = (quicConnection *) connCreateQuic();
-    quic_conn->quic = quic_connection;
-    quic_conn->info = *info;
+    quic_conn->quic_conn_handle = quic_connection;
     quic_conn->conn.state = CONN_STATE_ACCEPTING;
     return (connection *) quic_conn;
 }
 
-// TODO: Check if we need to do something here.
-static int connQuicConnect(connection *conn, const char *addr, int port, const char *src_addr,
-        ConnectionCallbackFunc connect_handler)
-{
+//TODO: Design Stream/Connection Shutdown/Close cases and then populate the func accordingly
+static void connQuicClose(connection *conn) {
     quicConnection *quic_conn = (quicConnection *) conn;
-    return C_OK;
+    QUIC_STATUS Status;
+
+    if(quic_conn->quic_conn_handle){
+        if(QUIC_FAILED(Status = server.cluster->quic_handlers.msquic->ConnectionShutDown(
+                                quic_conn->quic_conn_handle,
+                                QUIC_CONNECTION_SHUTDOWN_FLAG_NONE,
+                                0))){
+            serverLog(LL_WARNING, "Unable to shutdown the connection 0x%x!\n", Status);
+        }
+    }
 }
 
-// TODO: Implement stream write functions here.
-static int connQuicWrite(connection *conn, const void *data, size_t data_len) 
-{
-    quicConnection *quic_conn = (quicConnection *) conn;
-    return C_OK;
-}
-
-static void connQuicClose(connection *conn)
-{
-    quicConnection *quic_conn = (quicConnection *) conn;
-    server.cluster->quic_handlers.msquic->ConnectionClose(quic_conn->quic);
-    zfree(quic_conn);
-}
-
-// TODO: Point it to Quic error status instead of conn last error.
+// TODO: Design what should we do when there are errors during connections/stream
 static const char *connQuicGetLastError(connection *conn) 
 {
     quicConnection *quic_conn = (quicConnection *) conn;
@@ -67,13 +57,20 @@ static int connQuicGetType(connection *conn)
     return CONN_TYPE_QUIC;
 }
 
-// TODO: See if other handlers are required or not. 
-// Ideally, the other handlers should not be called for QUIC connections.
 ConnectionType CT_QUIC = {
-    .connect = connQuicConnect,
-    .write = connQuicWrite,
+    .ae_handler = NULL,
     .close = connQuicClose,
+    .write = NULL,
+    .read = NULL,
+    .accept = NULL,
+    .connect = NULL,
+    .set_write_handler = NULL,
+    .set_read_handler = NULL,
     .get_last_error = connQuicGetLastError,
+    .blocking_connect = NULL,
+    .sync_write = NULL,
+    .sync_read = NULL,
+    .sync_readline = NULL,
     .get_type = connQuicGetType
 };
 
