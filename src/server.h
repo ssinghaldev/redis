@@ -2209,6 +2209,7 @@ void clusterPropagatePublish(robj *channel, robj *message);
 void migrateCloseTimedoutSockets(void);
 void clusterBeforeSleep(void);
 int clusterSendModuleMessageToTarget(const char *target, uint64_t module_id, uint8_t type, unsigned char *payload, uint32_t len);
+void closeHandlers();
 
 /* Sentinel */
 void initSentinelConfig(void);

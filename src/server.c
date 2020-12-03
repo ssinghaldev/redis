@@ -3540,6 +3540,7 @@ void rejectCommandFormat(client *c, const char *fmt, ...) {
 int processCommand(client *c) {
     moduleCallCommandFilters(c);
 
+    serverLog(LL_NOTICE, "server received command: %s", c->argv[0]->ptr);
     /* The QUIT command is handled separately. Normal command procs will
      * go through checking for replication and QUIT will cause trouble
      * when FORCE_REPLICATION is enabled and would be implemented in
@@ -3902,8 +3903,15 @@ int prepareForShutdown(int flags) {
     closeListeningSockets(1);
     serverLog(LL_WARNING,"%s is now ready to exit, bye bye...",
         server.sentinel_mode ? "Sentinel" : "Redis");
+
+    /*Closing quic handlers*/
+    if (server.quic_config.quic_enabled){
+        closeHandlers();
+    }
+    
     return C_OK;
 }
+
 
 /*================================== Commands =============================== */
 
