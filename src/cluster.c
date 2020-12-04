@@ -6543,7 +6543,7 @@ void quicSendMessage(clusterLink *link, unsigned char *msg, size_t msglen){
     uint8_t* SendBufferRaw;
     QUIC_BUFFER* SendBuffer;
 
-    /* Create a unidirectional stream to send the packet*/
+    // Create a unidirectional stream to send the packet
     if (QUIC_FAILED(Status = server.cluster->quic_handlers.msquic->StreamOpen(
                             conn->quic_conn_handle, 
                             QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL, 
@@ -6557,7 +6557,9 @@ void quicSendMessage(clusterLink *link, unsigned char *msg, size_t msglen){
         return;
     }
 
-    /* Start the stream */
+/*
+
+    // Start the stream 
     if (QUIC_FAILED(Status = server.cluster->quic_handlers.msquic->StreamStart(
                                     Stream, 
                                     QUIC_STREAM_START_FLAG_NONE))) {
@@ -6567,7 +6569,7 @@ void quicSendMessage(clusterLink *link, unsigned char *msg, size_t msglen){
         freeClusterLink(link);
         return;
     }
-
+*/
     /* Allocate & copy the Buffer*/
     SendBufferRaw = (uint8_t*)zmalloc(sizeof(QUIC_BUFFER) + msglen);
     
@@ -6582,7 +6584,7 @@ void quicSendMessage(clusterLink *link, unsigned char *msg, size_t msglen){
     if (QUIC_FAILED(Status = server.cluster->quic_handlers.msquic->StreamSend(Stream, 
                                                 SendBuffer, 
                                                 1, //Buffer Count
-                                                QUIC_SEND_FLAG_FIN, 
+                                                QUIC_SEND_FLAG_START | QUIC_SEND_FLAG_FIN, 
                                                 SendBuffer))) {
         serverLog(LL_WARNING, "StreamSend failed, 0x%x!\n", Status);
         zfree(SendBufferRaw);
