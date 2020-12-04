@@ -853,8 +853,10 @@ void freeClusterLink(clusterLink *link) {
     }
     sdsfree(link->sndbuf);
     sdsfree(link->rcvbuf);
-    if (link->node)
+    if (link->node){
+        serverLog(LL_DEBUG, "In freeClusterLink, deleting link for node: %s", link->node->name);
         link->node->link = NULL;
+    }
     zfree(link);
 }
 
@@ -2574,6 +2576,12 @@ void clusterReadHandler(connection *conn) {
  * the link to be invalidated, so it is safe to call this function
  * from event handlers that will do stuff with the same link later. */
 void clusterSendMessage(clusterLink *link, unsigned char *msg, size_t msglen) {
+    if (link) {
+        serverLog(LL_DEBUG, "In clusterSendMessage, sending msg to node: %s", link->node->name);
+    } else {
+         serverLog(LL_DEBUG, "In clusterSendMessage, received link NULL");       
+    }
+
     if (server.quic_config.quic_enabled){
         quicSendMessage(link, msg, msglen);
     } else {
@@ -2588,6 +2596,8 @@ void clusterSendMessage(clusterLink *link, unsigned char *msg, size_t msglen) {
     uint16_t type = ntohs(hdr->type);
     if (type < CLUSTERMSG_TYPE_COUNT)
         server.cluster->stats_bus_messages_sent[type]++;
+    
+    serverLog(LL_DEBUG, "Exiting clusterSendMessage");
 }
 
 /* Send a message to all the nodes that are part of the cluster having
@@ -2719,6 +2729,13 @@ void clusterSetGossipEntry(clusterMsg *hdr, int i, clusterNode *n) {
 /* Send a PING or PONG packet to the specified node, making sure to add enough
  * gossip information. */
 void clusterSendPing(clusterLink *link, int type) {
+    if (link) {
+        serverLog(LL_DEBUG, "In clusterSendPing, sending msg type %d to node: %s", 
+                            type, link->node->name);
+    } else {
+         serverLog(LL_DEBUG, "In clusterSendPing, received link NULL");       
+    }
+
     unsigned char *buf;
     clusterMsg *hdr;
     int gossipcount = 0; /* Number of gossip sections added so far. */
@@ -2844,6 +2861,8 @@ void clusterSendPing(clusterLink *link, int type) {
     hdr->totlen = htonl(totlen);
     clusterSendMessage(link,buf,totlen);
     zfree(buf);
+
+    serverLog(LL_DEBUG, "Exiting clusterSendPing");
 }
 
 /* Send a PONG packet to every connected node that's not in handshake state
@@ -6435,6 +6454,11 @@ void quicStreamReadHandler(HQUIC Stream, quicConnection *quic_conn, QUIC_STREAM_
     // getQuicRemoteIP(link->conn, ip, sizeof(ip), port);
     // serverLog(LL_DEBUG,"Entering quicStreamReadHandler %s:%d.", ip, *port);
     serverLog(LL_DEBUG,"Entering quicStreamReadHandler");
+    if (link){
+        serverLog(LL_DEBUG, "In quicStreamReadHandler, Received packet from node: %s", link->node->name);
+    } else {
+        serverLog(LL_WARNING,"In quicStreamReadHandler, link is NULL");
+    }
 
     // Copying the quic buffer to clustermsg buf object.
     nread = 0;
@@ -6536,6 +6560,12 @@ int quicConnect(clusterNode* node, connection* conn){
 }
 
 void quicSendMessage(clusterLink *link, unsigned char *msg, size_t msglen){
+    if (link) {
+        serverLog(LL_DEBUG, "In quicSendMessage, sending msg to node: %s", link->node->name);
+    } else {
+         serverLog(LL_DEBUG, "In quicSendMessage, received link NULL");       
+    }
+
     quicConnection* conn = (quicConnection*) link->conn;
 
     QUIC_STATUS Status;
@@ -6591,6 +6621,8 @@ void quicSendMessage(clusterLink *link, unsigned char *msg, size_t msglen){
 
         freeClusterLink(link);
     }
+
+    serverLog(LL_DEBUG, "Exiting quicSendMessage");
 }
 
 int getQuicRemoteIP(connection *conn, char *ip, size_t ip_len, int *port) {
