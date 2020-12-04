@@ -91,7 +91,7 @@ QUIC_STATUS clientConnectionCallBack(HQUIC Connection, void *Context, QUIC_CONNE
 QUIC_STATUS quicStreamCallBack(HQUIC Stream, void *Context, QUIC_STREAM_EVENT *Event);
 void quicStreamReadHandler(HQUIC Stream, quicConnection *Context, QUIC_STREAM_EVENT *Event);
 void quicSendMessage(clusterLink *link, unsigned char *msg, size_t msglen);
-int getQuicRemoteIP(connection *conn, char *ip, size_t ip_len);
+int getQuicRemoteIP(connection *conn, char *ip, size_t ip_len, int *port);
 
 /* -----------------------------------------------------------------------------
  * Initialization
@@ -1753,7 +1753,7 @@ void nodeIp2String(char *buf, clusterLink *link, char *announced_ip) {
         memcpy(buf,announced_ip,NET_IP_STR_LEN);
         buf[NET_IP_STR_LEN-1] = '\0'; /* We are not sure the input is sane. */
     } else if (server.quic_config.quic_enabled) { // if quic enabled, call quic func
-        getQuicRemoteIP(link->conn, buf, NET_IP_STR_LEN);
+        getQuicRemoteIP(link->conn, buf, NET_IP_STR_LEN, NULL);
     } else {
         connPeerToString(link->conn, buf, NET_IP_STR_LEN, NULL);
     }
@@ -2072,7 +2072,7 @@ int clusterProcessPacket(clusterLink *link) {
             /* Calling QUIC func to get remote IP if quic enabled*/
             int ret = -1;
             if (server.quic_config.quic_enabled){
-                ret = getQuicRemoteIP(link->conn,ip,sizeof(ip));
+                ret = getQuicRemoteIP(link->conn,ip,sizeof(ip), NULL);
             } else {
                 ret = connSockName(link->conn,ip,sizeof(ip),NULL);
             }
@@ -3680,6 +3680,7 @@ void clusterHandleManualFailover(void) {
 
 /* This is executed 10 times every second */
 void clusterCron(void) {
+    serverLog(LL_DEBUG,"Entering clusterCron");
     dictIterator *di;
     dictEntry *de;
     int update_state = 0;
@@ -3966,6 +3967,8 @@ void clusterCron(void) {
 
     if (update_state || server.cluster->state == CLUSTER_FAIL)
         clusterUpdateState();
+
+    serverLog(LL_DEBUG,"Exiting clusterCron");
 }
 
 /* This function is called before the event handler returns to sleep for
@@ -3974,6 +3977,7 @@ void clusterCron(void) {
  * handlers, or to perform potentially expansive tasks that we need to do
  * a single time before replying to clients. */
 void clusterBeforeSleep(void) {
+    serverLog(LL_DEBUG,"Entering clusterBeforeSleep");
     /* Handle failover, this is needed when it is likely that there is already
      * the quorum from masters in order to react fast. */
     if (server.cluster->todo_before_sleep & CLUSTER_TODO_HANDLE_FAILOVER)
@@ -3993,6 +3997,7 @@ void clusterBeforeSleep(void) {
     /* Reset our flags (not strictly needed since every single function
      * called for flags set should be able to clear its flag). */
     server.cluster->todo_before_sleep = 0;
+    serverLog(LL_DEBUG,"Exiting clusterBeforeSleep");
 }
 
 void clusterDoBeforeSleep(int flags) {
@@ -6176,6 +6181,8 @@ QUIC_STATUS serverListenerCallBack(HQUIC Listener, void *Context, QUIC_LISTENER_
                 (void*)serverConnectionCallBack, 
                 (void*)conn);
 
+            serverLog(LL_NOTICE,"Set the server connection call back handler.");
+
             break;
         }
         default:
@@ -6192,6 +6199,14 @@ QUIC_STATUS serverConnectionCallBack(HQUIC Connection, void *Context, QUIC_CONNE
     switch (Event->Type) {
         case QUIC_CONNECTION_EVENT_CONNECTED:
         {
+            /* Adding this for debugging purposes. 
+            * Ideally IP has to be stored in conn object and should access here. */
+            // TODO: To be removed
+            // char ip[NET_IP_STR_LEN];
+            // int *port;
+            // getQuicRemoteIP((connection*)Context, ip, sizeof(ip), port);
+            // serverLog(LL_NOTICE,"Incoming connection from: %s:%d", ip, *port);
+
             /* Changing the status to connected*/
             quic_conn->conn.state = CONN_STATE_CONNECTED;
 
@@ -6199,7 +6214,7 @@ QUIC_STATUS serverConnectionCallBack(HQUIC Connection, void *Context, QUIC_CONNE
             clusterLink *link = createClusterLink(NULL);
             link->conn = (connection *)quic_conn;
             connSetPrivateData(&(quic_conn->conn), link);
-
+        
             break;
         }
         case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT:
@@ -6322,12 +6337,12 @@ QUIC_STATUS quicStreamCallBack(HQUIC Stream, void *Context, QUIC_STREAM_EVENT *E
         case QUIC_STREAM_EVENT_START_COMPLETE:
         {
             // This event is triggered if we are using async stream start. 
-            serverLog(LL_NOTICE,"Server received stream start event complete.");
+            serverLog(LL_NOTICE,"Received stream start event complete.");
             break;
         }
         case QUIC_STREAM_EVENT_RECEIVE:
         {
-            serverLog(LL_NOTICE,"Server received stream event receive.");
+            serverLog(LL_NOTICE,"Received stream event receive.");
 
             /* Checking if the received stream data containing header,
             *  if not informing the MsQuic library that no data has consumed and 
@@ -6362,39 +6377,39 @@ QUIC_STATUS quicStreamCallBack(HQUIC Stream, void *Context, QUIC_STREAM_EVENT *E
              * MSquic just copies the buffer app gave and fires this event
              * App is responsible for clearing any buffer allocated */
             zfree(Event->SEND_COMPLETE.ClientContext);
-            serverLog(LL_NOTICE,"Server received stream send event complete.");
+            serverLog(LL_NOTICE,"Received stream send event complete.");
             break;
         }
         case QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN:
         {
-            serverLog(LL_NOTICE,"Server received stream peer event send shutdown.");
+            serverLog(LL_NOTICE,"Received stream peer event send shutdown.");
             break;
         }
         case QUIC_STREAM_EVENT_PEER_SEND_ABORTED:
         {
-            serverLog(LL_NOTICE,"Server received stream peer event send aborted.");
+            serverLog(LL_NOTICE,"Received stream peer event send aborted.");
             break;
         }
         case QUIC_STREAM_EVENT_PEER_RECEIVE_ABORTED:
         {
-            serverLog(LL_NOTICE,"Server received stream peer event receive aborted.");
+            serverLog(LL_NOTICE,"Received stream peer event receive aborted.");
             break;
         }
         case QUIC_STREAM_EVENT_SEND_SHUTDOWN_COMPLETE:
         {
-            serverLog(LL_NOTICE,"Server received stream event send shutdown complete.");
+            serverLog(LL_NOTICE,"Received stream event send shutdown complete.");
             break;
         }
         case QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE:
         {
-            serverLog(LL_NOTICE,"Server received stream event shutdown complete.");
+            serverLog(LL_NOTICE,"Received stream event shutdown complete.");
             /* Closing the stream.*/
             server.cluster->quic_handlers.msquic->StreamClose(Stream);
             break;
         }
         case QUIC_STREAM_EVENT_IDEAL_SEND_BUFFER_SIZE:
         {
-            serverLog(LL_NOTICE,"Server received stream event ideal send buffer size.");
+            serverLog(LL_NOTICE,"Received stream event ideal send buffer size.");
             break;
         }
     }
@@ -6411,6 +6426,15 @@ void quicStreamReadHandler(HQUIC Stream, quicConnection *quic_conn, QUIC_STREAM_
     clusterMsg buf[1];
     uint64_t nread;
     clusterLink *link = connGetPrivateData(conn);
+
+    /* Adding this for debugging purposes. 
+     * Ideally IP has to be stored in conn object and should access here. */
+    // TODO: To be removed
+    // char ip[NET_IP_STR_LEN];
+    // int *port;
+    // getQuicRemoteIP(link->conn, ip, sizeof(ip), port);
+    // serverLog(LL_DEBUG,"Entering quicStreamReadHandler %s:%d.", ip, *port);
+    serverLog(LL_DEBUG,"Entering quicStreamReadHandler");
 
     // Copying the quic buffer to clustermsg buf object.
     nread = 0;
@@ -6471,6 +6495,7 @@ void quicStreamReadHandler(HQUIC Stream, quicConnection *quic_conn, QUIC_STREAM_
     clusterProcessPacket(link);
     sdsfree(link->rcvbuf);
     link->rcvbuf = sdsempty();
+    serverLog(LL_DEBUG,"Exiting quicStreamReadHandler.");
     return;
 }
 
@@ -6566,7 +6591,7 @@ void quicSendMessage(clusterLink *link, unsigned char *msg, size_t msglen){
     }
 }
 
-int getQuicRemoteIP(connection *conn, char *ip, size_t ip_len) {
+int getQuicRemoteIP(connection *conn, char *ip, size_t ip_len, int *port) {
     quicConnection *quic_conn = (quicConnection*)conn;
 
     QUIC_ADDR addr;
@@ -6591,6 +6616,6 @@ int getQuicRemoteIP(connection *conn, char *ip, size_t ip_len) {
 
     struct sockaddr_in *s = (struct sockaddr_in *)&(addr.Ipv4);
     if (ip) inet_ntop(AF_INET,(void*)&(s->sin_addr),ip,ip_len);
-
+    if (port) *port = ntohs(s->sin_port);
     return 0;
 }
