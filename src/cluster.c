@@ -848,6 +848,7 @@ void freeClusterLink(clusterLink *link) {
         return;
     }
     if (link->conn) {
+        serverLog(LL_DEBUG, "In freeClusterLink, deleting link of connObject: %p", (quicConnection*)link->conn);
         connClose(link->conn);
         link->conn = NULL;
     }
@@ -2576,10 +2577,12 @@ void clusterReadHandler(connection *conn) {
  * the link to be invalidated, so it is safe to call this function
  * from event handlers that will do stuff with the same link later. */
 void clusterSendMessage(clusterLink *link, unsigned char *msg, size_t msglen) {
-    if (link) {
+    if (link && link->node) {
         serverLog(LL_DEBUG, "In clusterSendMessage, sending msg to node: %s", link->node->name);
+    } else if(!link) {
+         serverLog(LL_WARNING, "In clusterSendMessage, received link NULL");       
     } else {
-         serverLog(LL_DEBUG, "In clusterSendMessage, received link NULL");       
+        serverLog(LL_DEBUG, "In clusterSendMessage, received node NULL");
     }
 
     if (server.quic_config.quic_enabled){
@@ -2729,11 +2732,13 @@ void clusterSetGossipEntry(clusterMsg *hdr, int i, clusterNode *n) {
 /* Send a PING or PONG packet to the specified node, making sure to add enough
  * gossip information. */
 void clusterSendPing(clusterLink *link, int type) {
-    if (link) {
+    if (link && link->node) {
         serverLog(LL_DEBUG, "In clusterSendPing, sending msg type %d to node: %s", 
                             type, link->node->name);
+    } else if (!link) {
+         serverLog(LL_WARNING, "In clusterSendPing, received link NULL");       
     } else {
-         serverLog(LL_DEBUG, "In clusterSendPing, received link NULL");       
+        serverLog(LL_DEBUG, "In clusterSendPing, received node NULL");
     }
 
     unsigned char *buf;
@@ -6250,6 +6255,7 @@ QUIC_STATUS serverConnectionCallBack(HQUIC Connection, void *Context, QUIC_CONNE
             /* We should close the connection once the shutdown the complete 
              * and free the quic_conn object */
             if (quic_conn){
+                serverLog(LL_DEBUG, "In serverConnectionCallBack, freeing the quic_conn object: %p.", quic_conn);    
                 server.cluster->quic_handlers.msquic->ConnectionClose(quic_conn->quic_conn_handle);
                 zfree(quic_conn);
             }
@@ -6327,6 +6333,7 @@ QUIC_STATUS clientConnectionCallBack(HQUIC Connection, void *Context, QUIC_CONNE
             /* We should close the connection once the shutdown the complete 
              * and free the quic_conn object */
             if (quic_conn){
+                serverLog(LL_DEBUG, "In clientConnectionCallBack, freeing the quic_conn object: %p.", quic_conn);     
                 server.cluster->quic_handlers.msquic->ConnectionClose(quic_conn->quic_conn_handle);
                 zfree(quic_conn);
             }
@@ -6454,10 +6461,12 @@ void quicStreamReadHandler(HQUIC Stream, quicConnection *quic_conn, QUIC_STREAM_
     // getQuicRemoteIP(link->conn, ip, sizeof(ip), port);
     // serverLog(LL_DEBUG,"Entering quicStreamReadHandler %s:%d.", ip, *port);
     serverLog(LL_DEBUG,"Entering quicStreamReadHandler");
-    if (link){
+    if (link && link->node){
         serverLog(LL_DEBUG, "In quicStreamReadHandler, Received packet from node: %s", link->node->name);
-    } else {
+    } else if (!link) {
         serverLog(LL_WARNING,"In quicStreamReadHandler, link is NULL");
+    } else {
+        serverLog(LL_DEBUG,"In quicStreamReadHandler, node is NULL");
     }
 
     // Copying the quic buffer to clustermsg buf object.
@@ -6560,10 +6569,13 @@ int quicConnect(clusterNode* node, connection* conn){
 }
 
 void quicSendMessage(clusterLink *link, unsigned char *msg, size_t msglen){
-    if (link) {
+    if (link && link->node) {
         serverLog(LL_DEBUG, "In quicSendMessage, sending msg to node: %s", link->node->name);
-    } else {
-         serverLog(LL_DEBUG, "In quicSendMessage, received link NULL");       
+    } else if(!link) {
+         serverLog(LL_WARNING, "In quicSendMessage, received link NULL");       
+    }
+    else {
+        serverLog(LL_DEBUG, "In quicSendMessage, received node NULL");
     }
 
     quicConnection* conn = (quicConnection*) link->conn;
