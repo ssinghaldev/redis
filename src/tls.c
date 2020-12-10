@@ -383,6 +383,7 @@ connection *connCreateAcceptedTLS(int fd, int require_auth) {
     SSL_set_fd(conn->ssl, conn->c.fd);
     SSL_set_accept_state(conn->ssl);
 
+    serverLog(LL_NOTICE, "Creating SSL conn object.");
     return (connection *) conn;
 }
 
@@ -460,7 +461,7 @@ static void tlsHandleEvent(tls_connection *conn, int mask) {
     int ret, conn_error;
 
     TLSCONN_DEBUG("tlsEventHandler(): fd=%d, state=%d, mask=%d, r=%d, w=%d, flags=%d",
-            fd, conn->c.state, mask, conn->c.read_handler != NULL, conn->c.write_handler != NULL,
+            conn->c.fd, conn->c.state, mask, conn->c.read_handler != NULL, conn->c.write_handler != NULL,
             conn->flags);
 
     ERR_clear_error();

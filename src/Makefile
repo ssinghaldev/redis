@@ -209,6 +209,7 @@ ifeq ($(MALLOC),jemalloc)
 endif
 
 ifeq ($(BUILD_TLS),yes)
+	FINAL_CFLAGS+=-DTLS_DEBUGGING
 	FINAL_CFLAGS+=-DUSE_OPENSSL $(OPENSSL_CFLAGS)
 	FINAL_LDFLAGS+=$(OPENSSL_LDFLAGS)
 	LIBSSL_PKGCONFIG := $(shell $(PKG_CONFIG) --exists libssl && echo $$?)

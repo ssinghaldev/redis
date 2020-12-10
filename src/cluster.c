@@ -499,7 +499,7 @@ void clusterInit(void) {
     /* Port sanity check II
      * The other handshake port check is triggered too late to stop
      * us from trying to use a too-high cluster port number. */
-    int port = server.tls_cluster ? server.tls_port : server.port;
+    int port = server.tls_cluster ? server.port : server.port;
     if (port > (65535-CLUSTER_PORT_INCR)) {
         serverLog(LL_WARNING, "Redis port number too high. "
                    "Cluster communication port is 10,000 port "
@@ -508,6 +508,8 @@ void clusterInit(void) {
                    "lower than 55535.");
         exit(1);
     }
+
+    serverLog(LL_WARNING, "Listening on port %lld", port+CLUSTER_PORT_INCR);
     if (listenToPort(port+CLUSTER_PORT_INCR,
         server.cfd,&server.cfd_count) == C_ERR)
     {
@@ -1864,6 +1866,10 @@ int clusterProcessPacket(clusterLink *link) {
             nodeIp2String(node->ip,link,hdr->myip);
             node->port = ntohs(hdr->port);
             node->cport = ntohs(hdr->cport);
+            serverLog(LL_DEBUG, "Creating node for clustermsg type meet for ip: %s, port: %lld, cport: %lld", 
+                        (char*)node->ip, 
+                        node->port, 
+                        node->cport);
             clusterAddNode(node);
             clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG);
         }
@@ -2408,7 +2414,7 @@ void clusterBuildMessageHdr(clusterMsg *hdr, int type) {
     }
 
     /* Handle cluster-announce-port as well. */
-    int port = server.tls_cluster ? server.tls_port : server.port;
+    int port = server.tls_cluster ? server.port : server.port;
     int announced_port = server.cluster_announce_port ?
                          server.cluster_announce_port : port;
     int announced_cport = server.cluster_announce_bus_port ?
@@ -4366,6 +4372,10 @@ NULL
             cport = port + CLUSTER_PORT_INCR;
         }
 
+        serverLog(LL_DEBUG, "MEET command for ip: %s, port: %lld, cport: %lld", 
+                        (char*)c->argv[2]->ptr, 
+                        port, 
+                        cport);
         if (clusterStartHandshake(c->argv[2]->ptr,port,cport) == 0 &&
             errno == EINVAL)
         {
