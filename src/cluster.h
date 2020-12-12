@@ -137,6 +137,7 @@ typedef struct clusterNode {
     int cport;                  /* Latest known cluster port of this node. */
     clusterLink *link;          /* TCP/IP link with this node */
     list *fail_reports;         /* List of nodes signaling this as failing */
+    int toConnectLink; /* Flag for quic synchronization when creating the link/connection*/
 } clusterNode;
 
 typedef struct quicHandlers

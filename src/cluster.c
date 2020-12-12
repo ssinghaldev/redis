@@ -1017,6 +1017,7 @@ clusterNode *createClusterNode(char *nodename, int flags) {
     node->repl_offset_time = 0;
     node->repl_offset = 0;
     listSetFreeMethod(node->fail_reports,zfree);
+    node->toConnectLink = 1;
     return node;
 }
 
@@ -1714,7 +1715,12 @@ void clusterProcessGossipSection(clusterMsg *hdr, clusterLink *link) {
                  node->port != ntohs(g->port) ||
                  node->cport != ntohs(g->cport)))
             {
-                if (node->link) freeClusterLink(node->link);
+                if (node->link) {
+                    serverLog(LL_DEBUG,
+                            "Freeing the link as Node %.40s reported node %.40s is back online.",
+                            sender->name, node->name);
+                    freeClusterLink(node->link);
+                }
                 memcpy(node->ip,g->ip,NET_IP_STR_LEN);
                 node->port = ntohs(g->port);
                 node->cport = ntohs(g->cport);
@@ -1797,7 +1803,11 @@ int nodeUpdateAddressIfNeeded(clusterNode *node, clusterLink *link,
     memcpy(node->ip,ip,sizeof(ip));
     node->port = port;
     node->cport = cport;
-    if (node->link) freeClusterLink(node->link);
+    if (node->link) {
+        serverLog(LL_DEBUG,"Address updated for node %.40s, now %s:%d. Hence freeing the link",
+            node->name, node->ip, node->port);  
+        freeClusterLink(node->link);
+    }
     node->flags &= ~CLUSTER_NODE_NOADDR;
     serverLog(LL_WARNING,"Address updated for node %.40s, now %s:%d",
         node->name, node->ip, node->port);
@@ -2136,6 +2146,7 @@ int clusterProcessPacket(clusterLink *link) {
                     }
                     /* Free this node as we already have it. This will
                      * cause the link to be freed as well. */
+                    serverLog(LL_DEBUG,"Deleting the node as it is duplicate");            
                     clusterDelNode(link->node);
                     return 0;
                 }
@@ -2154,7 +2165,7 @@ int clusterProcessPacket(clusterLink *link) {
                 /* If the reply has a non matching node ID we
                  * disconnect this node and set it as not having an associated
                  * address. */
-                serverLog(LL_DEBUG,"PONG contains mismatching sender ID. About node %.40s added %d ms ago, having flags %d",
+                serverLog(LL_DEBUG,"PONG contains mismatching sender ID. About node %.40s added %d ms ago, having flags %d. Freeing the link",
                     link->node->name,
                     (int)(now-(link->node->ctime)),
                     link->node->flags);
@@ -2214,6 +2225,7 @@ int clusterProcessPacket(clusterLink *link) {
             if (!memcmp(hdr->slaveof,CLUSTER_NODE_NULL_NAME,
                 sizeof(hdr->slaveof)))
             {
+                serverLog(LL_DEBUG, "Setting sender:%.40s as master whose ip is %s", sender->name, sender->ip);
                 /* Node is a master. */
                 clusterSetNodeAsMaster(sender);
             } else {
@@ -2222,6 +2234,7 @@ int clusterProcessPacket(clusterLink *link) {
 
                 if (nodeIsMaster(sender)) {
                     /* Master turned into a slave! Reconfigure the node. */
+                    serverLog(LL_DEBUG, "sender:%.40s sender_ip:%s was previously master turned to a slave", sender->name, sender->ip);
                     clusterDelNodeSlots(sender);
                     sender->flags &= ~(CLUSTER_NODE_MASTER|
                                        CLUSTER_NODE_MIGRATE_TO);
@@ -2234,6 +2247,11 @@ int clusterProcessPacket(clusterLink *link) {
 
                 /* Master node changed for this slave? */
                 if (master && sender->slaveof != master) {
+                    serverLog(LL_DEBUG, "sender:%.40s sender_ip:%s master changed. prev_master:%0.40s prev_master_ip:%d new master:%.40s new_master_ip:%s", 
+                                        sender->name, sender->ip, 
+                                        sender->slaveof->name, sender->slaveof->ip, 
+                                        master->name, master->ip);
+
                     if (sender->slaveof)
                         clusterNodeRemoveSlave(sender->slaveof,sender);
                     clusterNodeAddSlave(master,sender);
@@ -2268,8 +2286,11 @@ int clusterProcessPacket(clusterLink *link) {
         /* 1) If the sender of the message is a master, and we detected that
          *    the set of slots it claims changed, scan the slots to see if we
          *    need to update our configuration. */
-        if (sender && nodeIsMaster(sender) && dirty_slots)
-            clusterUpdateSlotsConfigWith(sender,senderConfigEpoch,hdr->myslots);
+        if (sender && nodeIsMaster(sender) && dirty_slots){
+            serverLog(LL_DEBUG, "Updating sender:%.40s sender_ip:%s slots", sender->name, sender->ip); 
+            clusterUpdateSlotsConfigWith(sender,senderConfigEpoch,hdr->myslots); 
+        }
+            
 
         /* 2) We also check for the reverse condition, that is, the sender
          *    claims to serve slots we know are served by a master with a
@@ -3775,6 +3796,8 @@ void clusterCron(void) {
         /* A Node in HANDSHAKE state has a limited lifespan equal to the
          * configured node timeout. */
         if (nodeInHandshake(node) && now - node->ctime > handshake_timeout) {
+            serverLog(LL_DEBUG, "Deleting node as handshake timed out. now: %lld node->ctimeTime: %lld", 
+                                now, node->ctime);
             clusterDelNode(node);
             continue;
         }
@@ -3782,7 +3805,16 @@ void clusterCron(void) {
         if (node->link == NULL) {
             /* if quic enabled*/
             if (server.quic_config.quic_enabled) {
-                /* Create a dummy link & connection obj and link it */
+                if(!node->toConnectLink){
+                    serverLog(LL_DEBUG, "Link still in connecting state for Cluster Node [%s]:%d", 
+                                        node->ip, node->cport);
+                    continue;
+                }
+
+                node->toConnectLink = 0;
+                serverLog(LL_DEBUG,"Creating dummy link with node %.40s at [%s]:%d", 
+                                    node->name, node->ip, node->cport);
+                
                 clusterLink *link = createClusterLink(node);
                 link->conn = connCreateQuicSocket();
                 connSetPrivateData(link->conn, link);
@@ -3796,14 +3828,14 @@ void clusterCron(void) {
                     * be really sent as soon as the link is obtained). */
                     if (node->ping_sent == 0) node->ping_sent = mstime();
                     serverLog(LL_DEBUG, "Unable to connect to "
-                        "Cluster Node [%s]:%d", node->ip,
+                        "Cluster Node [%s]:%d. Freeing the link", node->ip,
                         node->cport);
 
+                    node->toConnectLink = 1;
                     freeClusterLink(link);
                     continue;
                 }
 
-                node->link = link;
                 continue;
             }
 
@@ -3909,6 +3941,8 @@ void clusterCron(void) {
             data_delay > server.cluster_node_timeout/2)
         {
             /* Disconnect the link, it will be reconnected automatically. */
+            serverLog(LL_DEBUG,"Freeing ClusterLink as half node timeout reached for node: %.40s",
+                                node->name);
             freeClusterLink(node->link);
         }
 
@@ -6246,6 +6280,7 @@ QUIC_STATUS serverConnectionCallBack(HQUIC Connection, void *Context, QUIC_CONNE
         {
             clusterLink *link = (clusterLink*)connGetPrivateData(&(quic_conn->conn));
             if (link) {
+                serverLog(LL_DEBUG, "In serverConnectionCallBack, shutdown intiated and freeing the link");
                 freeClusterLink(link);
             }
             break;
@@ -6294,8 +6329,16 @@ QUIC_STATUS clientConnectionCallBack(HQUIC Connection, void *Context, QUIC_CONNE
             * If the node is flagged as MEET, we send a MEET message instead
             * of a PING one, to force the receiver to add us in its node
             * table. */
+            
             clusterLink *link = (clusterLink*) connGetPrivateData(&(quic_conn->conn));
             clusterNode *node = link->node;
+
+            /* Setting the link once the connection is established*/
+            /* Setting toConnectLink too so that future links can be established*/
+            node->link = link;
+            node->toConnectLink = 1;
+            serverLog(LL_DEBUG,"Link established with node %.40s at [%s]:%d", 
+                                            node->name, node->ip, node->cport);
 
             mstime_t old_ping_sent = node->ping_sent;
             clusterSendPing(link, node->flags & CLUSTER_NODE_MEET ?
@@ -6324,6 +6367,10 @@ QUIC_STATUS clientConnectionCallBack(HQUIC Connection, void *Context, QUIC_CONNE
         {
             clusterLink *link = (clusterLink*)connGetPrivateData(&(quic_conn->conn));
             if (link) {
+                clusterNode *node = link->node;
+                node->toConnectLink = 1;
+                
+                serverLog(LL_DEBUG, "In clientConnectionCallBack, shutdown intiated and freeing the link");
                 freeClusterLink(link);
             }
             break;
