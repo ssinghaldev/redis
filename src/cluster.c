@@ -470,8 +470,10 @@ int initQuicServer(
     int initialized =  1;
     QUIC_STATUS status = QUIC_STATUS_SUCCESS;
     QUIC_ADDR address = {0};
-    QuicAddrSetFamily(&address, QUIC_ADDRESS_FAMILY_UNSPEC);
-    QuicAddrSetPort(&address, port);
+    // QuicAddrSetFamily(&address, QUIC_ADDRESS_FAMILY_UNSPEC);
+    // QuicAddrSetPort(&address, port);
+    address.Ip.sa_family = QUIC_ADDRESS_FAMILY_UNSPEC;
+    address.Ipv4.sin_port = htons(port);
 
     QUIC_SETTINGS settings = {0};
     settings.IdleTimeoutMs = server.quic_config.idle_timeout_ms;

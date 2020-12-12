@@ -1043,7 +1043,7 @@ void serverLogRaw(int level, const char *msg) {
         struct timeval tv;
         int role_char;
         pid_t pid = getpid();
-        pid_t tid = gettid();
+        // pid_t tid = gettid();
 
         gettimeofday(&tv,NULL);
         struct tm tm;
@@ -1057,8 +1057,8 @@ void serverLogRaw(int level, const char *msg) {
         } else {
             role_char = (server.masterhost ? 'S':'M'); /* Slave or Master. */
         }
-        fprintf(fp,"%d:%c:%d %s %c %s\n",
-            (int)getpid(),role_char,(int)tid, buf,c[level],msg);
+        fprintf(fp,"%d:%c %s %c %s\n",
+            (int)getpid(),role_char, buf,c[level],msg);
     }
     fflush(fp);
 
