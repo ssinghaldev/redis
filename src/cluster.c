@@ -2249,16 +2249,20 @@ int clusterProcessPacket(clusterLink *link) {
 
                 /* Master node changed for this slave? */
                 if (master && sender->slaveof != master) {
-                    serverLog(LL_DEBUG, "sender:%.40s sender_ip:%s master changed. prev_master:%0.40s prev_master_ip:%s new master:%.40s new_master_ip:%s", 
-                                        sender->name, sender->ip, 
-                                        sender->slaveof->name, sender->slaveof->ip, 
-                                        master->name, master->ip);
+                    if (sender->slaveof){
+                        serverLog(LL_DEBUG, "sender:%.40s sender_ip:%s master changed. prev_master:%0.40s prev_master_ip:%s", 
+                                            sender->name, sender->ip, 
+                                            sender->slaveof->name, sender->slaveof->ip);
 
-                    if (sender->slaveof)
                         clusterNodeRemoveSlave(sender->slaveof,sender);
+                    }
+                        
                     clusterNodeAddSlave(master,sender);
                     sender->slaveof = master;
 
+                    serverLog(LL_DEBUG, "sender:%.40s sender_ip:%s master changed. new_master:%0.40s new_master_ip:%s", 
+                                        sender->name, sender->ip, 
+                                        sender->slaveof->name, sender->slaveof->ip);
                     /* Update config. */
                     clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG);
                 }
