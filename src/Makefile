@@ -15,7 +15,7 @@
 release_hdr := $(shell sh -c './mkreleasehdr.sh')
 uname_S := $(shell sh -c 'uname -s 2>/dev/null || echo not')
 uname_M := $(shell sh -c 'uname -m 2>/dev/null || echo not')
-OPTIMIZATION?=-O2
+OPTIMIZATION?=-O0
 DEPENDENCY_TARGETS=hiredis linenoise lua
 NODEPS:=clean distclean
 
@@ -225,6 +225,10 @@ else
 endif
 	FINAL_LIBS += ../deps/hiredis/libhiredis_ssl.a $(LIBSSL_LIBS) $(LIBCRYPTO_LIBS)
 endif
+
+# MsQUIC changes
+FINAL_CFLAGS+= -I/usr/local/msquic/include
+FINAL_LIBS+= -L/usr/local/msquic/lib -lmsquic
 
 REDIS_CC=$(QUIET_CC)$(CC) $(FINAL_CFLAGS)
 REDIS_LD=$(QUIET_LINK)$(CC) $(FINAL_LDFLAGS)

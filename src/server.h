@@ -1033,6 +1033,19 @@ typedef struct redisTLSContextConfig {
     int session_cache_timeout;
 } redisTLSContextConfig;
 
+typedef struct redisQuicConfig
+{
+    int quic_enabled;
+    int peer_bidi_stream_count;
+    int is_set_peer_bidi_stream_count;
+    int peer_uni_stream_count;
+    int is_set_peer_uni_stream_count;
+    long long idle_timeout_ms;
+    int is_set_idle_timeout_ms;
+    char *cert_file;
+    char *key_file;
+}redisQuicConfig;
+
 /*-----------------------------------------------------------------------------
  * Global server state
  *----------------------------------------------------------------------------*/
@@ -1475,6 +1488,9 @@ struct redisServer {
     char *bio_cpulist; /* cpu affinity list of bio thread. */
     char *aof_rewrite_cpulist; /* cpu affinity list of aof rewrite process. */
     char *bgsave_cpulist; /* cpu affinity list of bgsave process. */
+
+    /* QUIC configuration */
+    redisQuicConfig quic_config;
 };
 
 typedef struct pubsubPattern {
@@ -2193,6 +2209,7 @@ void clusterPropagatePublish(robj *channel, robj *message);
 void migrateCloseTimedoutSockets(void);
 void clusterBeforeSleep(void);
 int clusterSendModuleMessageToTarget(const char *target, uint64_t module_id, uint8_t type, unsigned char *payload, uint32_t len);
+void closeHandlers();
 
 /* Sentinel */
 void initSentinelConfig(void);

@@ -31,6 +31,7 @@
 #include "server.h"
 #include "cluster.h"
 #include "endianconv.h"
+#include "quic.h"
 
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -45,6 +46,8 @@
  * Myself always points to server.cluster->myself, that is, the clusterNode
  * that represents this node. */
 clusterNode *myself = NULL;
+QUIC_REGISTRATION_CONFIG reg_config = { "quic_redis", QUIC_EXECUTION_PROFILE_LOW_LATENCY };
+QUIC_BUFFER alpn = { sizeof("sample") - 1, (uint8_t*)"sample" };
 
 clusterNode *createClusterNode(char *nodename, int flags);
 int clusterAddNode(clusterNode *node);
@@ -76,6 +79,19 @@ sds representClusterNodeFlags(sds ci, uint16_t flags);
 uint64_t clusterGetMaxEpoch(void);
 int clusterBumpConfigEpochWithoutConsensus(void);
 void moduleCallClusterReceivers(const char *sender_id, uint64_t module_id, uint8_t type, const unsigned char *payload, uint32_t len);
+
+/* Quic related functions */
+int quicInit(int port);
+int initQuicServer(int port);
+int initQuicClient(int port);
+int quicConnect(clusterNode* node, connection* conn);
+QUIC_STATUS serverListenerCallBack(HQUIC listener, void* context, QUIC_LISTENER_EVENT* Event);
+QUIC_STATUS serverConnectionCallBack(HQUIC Connection, void *Context, QUIC_CONNECTION_EVENT *Event);
+QUIC_STATUS clientConnectionCallBack(HQUIC Connection, void *Context, QUIC_CONNECTION_EVENT *Event);
+QUIC_STATUS quicStreamCallBack(HQUIC Stream, void *Context, QUIC_STREAM_EVENT *Event);
+void quicStreamReadHandler(HQUIC Stream, quicConnection *Context, QUIC_STREAM_EVENT *Event);
+void quicSendMessage(clusterLink *link, unsigned char *msg, size_t msglen);
+int getQuicRemoteIP(connection *conn, char *ip, size_t ip_len, int *port);
 
 /* -----------------------------------------------------------------------------
  * Initialization
@@ -448,6 +464,201 @@ void clusterUpdateMyselfFlags(void) {
     }
 }
 
+int initQuicServer(
+    int port)
+{
+    int initialized =  1;
+    QUIC_STATUS status = QUIC_STATUS_SUCCESS;
+    QUIC_ADDR address = {0};
+    // QuicAddrSetFamily(&address, QUIC_ADDRESS_FAMILY_UNSPEC);
+    // QuicAddrSetPort(&address, port);
+    address.Ip.sa_family = QUIC_ADDRESS_FAMILY_UNSPEC;
+    address.Ipv4.sin_port = htons(port);
+
+    QUIC_SETTINGS settings = {0};
+    settings.IdleTimeoutMs = server.quic_config.idle_timeout_ms;
+    settings.IsSet.IdleTimeoutMs = server.quic_config.is_set_idle_timeout_ms;
+    settings.PeerBidiStreamCount = server.quic_config.peer_bidi_stream_count;
+    settings.IsSet.PeerBidiStreamCount = server.quic_config.is_set_peer_bidi_stream_count;
+    settings.PeerUnidiStreamCount = server.quic_config.peer_uni_stream_count;
+    settings.IsSet.PeerUnidiStreamCount = server.quic_config.is_set_peer_uni_stream_count;
+
+    QUIC_CREDENTIAL_CONFIG config;
+    QUIC_CERTIFICATE_FILE cert_file;
+    memset(&config, 0, sizeof(config));
+    config.Flags = QUIC_CREDENTIAL_FLAG_NONE;
+    if (server.quic_config.cert_file != NULL && 
+            server.quic_config.key_file != NULL) 
+    {
+        cert_file.CertificateFile = server.quic_config.cert_file;
+        cert_file.PrivateKeyFile = server.quic_config.key_file;
+        config.Type = QUIC_CREDENTIAL_TYPE_CERTIFICATE_FILE;
+        config.CertificateFile = &cert_file;
+    } 
+    else 
+    {
+        serverLog(LL_WARNING,"Must specify cert_file and key_file.");
+        initialized = 0;
+    }
+
+    if (initialized && QUIC_FAILED(status = server.cluster->quic_handlers.msquic->ConfigurationOpen(
+                        server.cluster->quic_handlers.registration, 
+                        &alpn, 
+                        1, 
+                        &settings, 
+                        sizeof(settings), 
+                        NULL, 
+                        &(server.cluster->quic_handlers.server_configuration)))) 
+    {
+        serverLog(LL_WARNING,"Quic server ConfigurationOpen failed, 0x%x\n.", status);
+        initialized = 0;
+    }
+
+    if (initialized && QUIC_FAILED(status = server.cluster->quic_handlers.msquic->ConfigurationLoadCredential(
+                        server.cluster->quic_handlers.server_configuration, 
+                        &config)))
+    {
+        serverLog(LL_WARNING,"Quic server ConfigurationLoadCredential failed, 0x%x\n.", status);
+        initialized = 0;
+    }
+
+
+    if (initialized && QUIC_FAILED(status = server.cluster->quic_handlers.msquic->ListenerOpen(
+                        server.cluster->quic_handlers.registration, 
+                        serverListenerCallBack,
+                        NULL, 
+                        &(server.cluster->quic_handlers.listener)))) 
+    {
+        serverLog(LL_WARNING,"Quic server ListenerOpen failed 0x%x\n", status);
+        initialized = 0;;
+    }
+
+    if (initialized && QUIC_FAILED(status = server.cluster->quic_handlers.msquic->ListenerStart(
+                        server.cluster->quic_handlers.listener, 
+                        &alpn, 
+                        1, 
+                        &address))) 
+    {
+        serverLog(LL_WARNING,"Quic server ListenerStart failed 0x%x\n", status);
+        initialized = 0;;
+    }
+
+    return initialized;
+}
+
+int initQuicClient(
+    int port)
+{
+    int initialized = 1;
+    QUIC_STATUS status = QUIC_STATUS_SUCCESS;
+    QUIC_SETTINGS settings = {0};
+    settings.IdleTimeoutMs = server.quic_config.idle_timeout_ms;
+    settings.IsSet.IdleTimeoutMs = server.quic_config.is_set_idle_timeout_ms;
+    settings.PeerBidiStreamCount = server.quic_config.peer_bidi_stream_count;
+    settings.IsSet.PeerBidiStreamCount = server.quic_config.is_set_peer_bidi_stream_count;
+    settings.PeerUnidiStreamCount = server.quic_config.peer_uni_stream_count;
+    settings.IsSet.PeerUnidiStreamCount = server.quic_config.is_set_peer_uni_stream_count;
+
+    QUIC_CREDENTIAL_CONFIG cred_config;
+    memset(&cred_config, 0, sizeof(cred_config));
+    cred_config.Type = QUIC_CREDENTIAL_TYPE_NONE;
+    cred_config.Flags = QUIC_CREDENTIAL_FLAG_CLIENT;
+    // TODO: Check certification validation required flags.
+    cred_config.Flags |= QUIC_CREDENTIAL_FLAG_NO_CERTIFICATE_VALIDATION;
+ 
+    if (QUIC_FAILED(status = server.cluster->quic_handlers.msquic->ConfigurationOpen(
+                        server.cluster->quic_handlers.registration, 
+                        &alpn, 
+                        1, 
+                        &settings, 
+                        sizeof(settings), 
+                        NULL, 
+                        &(server.cluster->quic_handlers.client_configuration)))) 
+    {
+        serverLog(LL_WARNING,"Quic client ConfigurationOpen failed., 0x%x\n.", status);
+        initialized = 0;
+    }
+
+    if (initialized && QUIC_FAILED(status = server.cluster->quic_handlers.msquic->ConfigurationLoadCredential(
+                        server.cluster->quic_handlers.client_configuration, 
+                        &cred_config))) 
+    {
+        serverLog(LL_WARNING,"Quic client ConfigurationLoadCredential failed., 0x%x\n.", status);
+        initialized = 0;
+    }
+
+    return initialized;
+}
+
+void closeHandlers()
+{
+    serverLog(LL_NOTICE,"Entered into closehandlers.");
+    if (server.cluster->quic_handlers.listener != NULL) 
+    {
+        serverLog(LL_NOTICE,"closing listener.");
+        server.cluster->quic_handlers.msquic->ListenerClose(server.cluster->quic_handlers.listener);
+    }
+    if (server.cluster->quic_handlers.server_configuration != NULL) 
+    {
+        serverLog(LL_NOTICE,"closing server configuration.");
+        server.cluster->quic_handlers.msquic->ConfigurationClose(server.cluster->quic_handlers.server_configuration);
+    }
+    if (server.cluster->quic_handlers.client_configuration != NULL) 
+    {
+        serverLog(LL_NOTICE,"closing client configuration.");
+        server.cluster->quic_handlers.msquic->ConfigurationClose(server.cluster->quic_handlers.client_configuration);
+    }
+    if (server.cluster->quic_handlers.registration != NULL) 
+    {
+        serverLog(LL_NOTICE,"closing registration.");
+        server.cluster->quic_handlers.msquic->RegistrationShutdown(
+                                                server.cluster->quic_handlers.registration, 
+                                                QUIC_CONNECTION_SHUTDOWN_FLAG_SILENT,
+                                                0);
+        server.cluster->quic_handlers.msquic->RegistrationClose(server.cluster->quic_handlers.registration);
+    }
+    
+    if (server.cluster->quic_handlers.msquic != NULL)
+    {
+        MsQuicClose(server.cluster->quic_handlers.msquic);
+    }
+    serverLog(LL_NOTICE,"Exited the closehandlers.");
+}
+
+int quicInit(int port)
+{
+    QUIC_STATUS status = QUIC_STATUS_SUCCESS;
+    int initialized = 1;
+    if (QUIC_FAILED(status = MsQuicOpen(&(server.cluster->quic_handlers.msquic)))) 
+    {
+        serverLog(LL_WARNING,"Unable to open MsQuic lib.");
+        initialized = 0;
+    }
+    
+    if (initialized && QUIC_FAILED(status = server.cluster->quic_handlers.msquic->RegistrationOpen(
+                        &reg_config, 
+                        &(server.cluster->quic_handlers.registration)))) 
+    {
+       serverLog(LL_WARNING,"Quic RegistrationOpen failed., 0x%x\n.", status);
+       initialized = 0;
+    }
+
+    if (initialized && !initQuicServer(port))
+    {
+        serverLog(LL_WARNING,"QUIC server initialization failed.");
+        initialized = 0;
+    }
+
+    if (initialized && !initQuicClient(port))
+    {
+        serverLog(LL_WARNING,"QUIC client initialization failed.");
+        initialized = 0;
+    }
+
+    serverLog(LL_NOTICE,"QUIC initialized with status %d.", initialized);
+    return initialized;
+}
+
 void clusterInit(void) {
     int saveconf = 0;
 
@@ -508,7 +719,17 @@ void clusterInit(void) {
                    "lower than 55535.");
         exit(1);
     }
-    if (listenToPort(port+CLUSTER_PORT_INCR,
+
+    // server.cluster->quic_handlers = zmalloc(sizeof(quicHandlers));
+    if(server.quic_config.quic_enabled)
+    {
+        if (!quicInit(port+CLUSTER_PORT_INCR))
+        {
+            serverLog(LL_WARNING, "Unable to initialize QUIC listener.");
+            exit(1);
+        }
+    }
+    else if (listenToPort(port+CLUSTER_PORT_INCR,
         server.cfd,&server.cfd_count) == C_ERR)
     {
         exit(1);
@@ -623,14 +844,22 @@ clusterLink *createClusterLink(clusterNode *node) {
  * This function will just make sure that the original node associated
  * with this link will have the 'link' field set to NULL. */
 void freeClusterLink(clusterLink *link) {
+    /* Defensive check*/
+    if(!link){
+        serverLog(LL_WARNING, "Freeing the NULL Link!!");
+        return;
+    }
     if (link->conn) {
+        serverLog(LL_DEBUG, "In freeClusterLink, deleting link of connObject: %p", (quicConnection*)link->conn);
         connClose(link->conn);
         link->conn = NULL;
     }
     sdsfree(link->sndbuf);
     sdsfree(link->rcvbuf);
-    if (link->node)
+    if (link->node){
+        serverLog(LL_DEBUG, "In freeClusterLink, deleting link for node: %s", link->node->name);
         link->node->link = NULL;
+    }
     zfree(link);
 }
 
@@ -790,6 +1019,7 @@ clusterNode *createClusterNode(char *nodename, int flags) {
     node->repl_offset_time = 0;
     node->repl_offset = 0;
     listSetFreeMethod(node->fail_reports,zfree);
+    node->toConnectLink = 1;
     return node;
 }
 
@@ -1274,7 +1504,7 @@ void markNodeAsFailingIfNeeded(clusterNode *node) {
     if (nodeIsMaster(myself)) failures++;
     if (failures < needed_quorum) return; /* No weak agreement from masters. */
 
-    serverLog(LL_NOTICE,
+    serverLog(LL_WARNING,
         "Marking node %.40s as failing (quorum reached).", node->name);
 
     /* Mark the node as failing. */
@@ -1487,7 +1717,12 @@ void clusterProcessGossipSection(clusterMsg *hdr, clusterLink *link) {
                  node->port != ntohs(g->port) ||
                  node->cport != ntohs(g->cport)))
             {
-                if (node->link) freeClusterLink(node->link);
+                if (node->link) {
+                    serverLog(LL_DEBUG,
+                            "Freeing the link as Node %.40s reported node %.40s is back online.",
+                            sender->name, node->name);
+                    freeClusterLink(node->link);
+                }
                 memcpy(node->ip,g->ip,NET_IP_STR_LEN);
                 node->port = ntohs(g->port);
                 node->cport = ntohs(g->cport);
@@ -1528,6 +1763,8 @@ void nodeIp2String(char *buf, clusterLink *link, char *announced_ip) {
     if (announced_ip[0] != '\0') {
         memcpy(buf,announced_ip,NET_IP_STR_LEN);
         buf[NET_IP_STR_LEN-1] = '\0'; /* We are not sure the input is sane. */
+    } else if (server.quic_config.quic_enabled) { // if quic enabled, call quic func
+        getQuicRemoteIP(link->conn, buf, NET_IP_STR_LEN, NULL);
     } else {
         connPeerToString(link->conn, buf, NET_IP_STR_LEN, NULL);
     }
@@ -1568,7 +1805,11 @@ int nodeUpdateAddressIfNeeded(clusterNode *node, clusterLink *link,
     memcpy(node->ip,ip,sizeof(ip));
     node->port = port;
     node->cport = cport;
-    if (node->link) freeClusterLink(node->link);
+    if (node->link) {
+        serverLog(LL_DEBUG,"Address updated for node %.40s, now %s:%d. Hence freeing the link",
+            node->name, node->ip, node->port);  
+        freeClusterLink(node->link);
+    }
     node->flags &= ~CLUSTER_NODE_NOADDR;
     serverLog(LL_WARNING,"Address updated for node %.40s, now %s:%d",
         node->name, node->ip, node->port);
@@ -1842,9 +2083,16 @@ int clusterProcessPacket(clusterLink *link) {
             server.cluster_announce_ip == NULL)
         {
             char ip[NET_IP_STR_LEN];
+            
+            /* Calling QUIC func to get remote IP if quic enabled*/
+            int ret = -1;
+            if (server.quic_config.quic_enabled){
+                ret = getQuicRemoteIP(link->conn,ip,sizeof(ip), NULL);
+            } else {
+                ret = connSockName(link->conn,ip,sizeof(ip),NULL);
+            }
 
-            if (connSockName(link->conn,ip,sizeof(ip),NULL) != -1 &&
-                strcmp(ip,myself->ip))
+            if (ret != -1 && strcmp(ip,myself->ip))
             {
                 memcpy(myself->ip,ip,NET_IP_STR_LEN);
                 serverLog(LL_WARNING,"IP address for this node updated to %s",
@@ -1900,6 +2148,7 @@ int clusterProcessPacket(clusterLink *link) {
                     }
                     /* Free this node as we already have it. This will
                      * cause the link to be freed as well. */
+                    serverLog(LL_DEBUG,"Deleting the node as it is duplicate");            
                     clusterDelNode(link->node);
                     return 0;
                 }
@@ -1918,7 +2167,7 @@ int clusterProcessPacket(clusterLink *link) {
                 /* If the reply has a non matching node ID we
                  * disconnect this node and set it as not having an associated
                  * address. */
-                serverLog(LL_DEBUG,"PONG contains mismatching sender ID. About node %.40s added %d ms ago, having flags %d",
+                serverLog(LL_DEBUG,"PONG contains mismatching sender ID. About node %.40s added %d ms ago, having flags %d. Freeing the link",
                     link->node->name,
                     (int)(now-(link->node->ctime)),
                     link->node->flags);
@@ -1978,6 +2227,7 @@ int clusterProcessPacket(clusterLink *link) {
             if (!memcmp(hdr->slaveof,CLUSTER_NODE_NULL_NAME,
                 sizeof(hdr->slaveof)))
             {
+                serverLog(LL_DEBUG, "Setting sender:%.40s as master whose ip is %s", sender->name, sender->ip);
                 /* Node is a master. */
                 clusterSetNodeAsMaster(sender);
             } else {
@@ -1986,6 +2236,7 @@ int clusterProcessPacket(clusterLink *link) {
 
                 if (nodeIsMaster(sender)) {
                     /* Master turned into a slave! Reconfigure the node. */
+                    serverLog(LL_DEBUG, "sender:%.40s sender_ip:%s was previously master turned to a slave", sender->name, sender->ip);
                     clusterDelNodeSlots(sender);
                     sender->flags &= ~(CLUSTER_NODE_MASTER|
                                        CLUSTER_NODE_MIGRATE_TO);
@@ -1998,11 +2249,20 @@ int clusterProcessPacket(clusterLink *link) {
 
                 /* Master node changed for this slave? */
                 if (master && sender->slaveof != master) {
-                    if (sender->slaveof)
+                    if (sender->slaveof){
+                        serverLog(LL_DEBUG, "sender:%.40s sender_ip:%s master changed. prev_master:%0.40s prev_master_ip:%s", 
+                                            sender->name, sender->ip, 
+                                            sender->slaveof->name, sender->slaveof->ip);
+
                         clusterNodeRemoveSlave(sender->slaveof,sender);
+                    }
+                        
                     clusterNodeAddSlave(master,sender);
                     sender->slaveof = master;
 
+                    serverLog(LL_DEBUG, "sender:%.40s sender_ip:%s master changed. new_master:%0.40s new_master_ip:%s", 
+                                        sender->name, sender->ip, 
+                                        sender->slaveof->name, sender->slaveof->ip);
                     /* Update config. */
                     clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG);
                 }
@@ -2032,8 +2292,11 @@ int clusterProcessPacket(clusterLink *link) {
         /* 1) If the sender of the message is a master, and we detected that
          *    the set of slots it claims changed, scan the slots to see if we
          *    need to update our configuration. */
-        if (sender && nodeIsMaster(sender) && dirty_slots)
-            clusterUpdateSlotsConfigWith(sender,senderConfigEpoch,hdr->myslots);
+        if (sender && nodeIsMaster(sender) && dirty_slots){
+            serverLog(LL_DEBUG, "Updating sender:%.40s sender_ip:%s slots", sender->name, sender->ip); 
+            clusterUpdateSlotsConfigWith(sender,senderConfigEpoch,hdr->myslots); 
+        }
+            
 
         /* 2) We also check for the reverse condition, that is, the sender
          *    claims to serve slots we know are served by a master with a
@@ -2098,7 +2361,7 @@ int clusterProcessPacket(clusterLink *link) {
             if (failing &&
                 !(failing->flags & (CLUSTER_NODE_FAIL|CLUSTER_NODE_MYSELF)))
             {
-                serverLog(LL_NOTICE,
+                serverLog(LL_WARNING,
                     "FAIL message received from %.40s about %.40s",
                     hdr->sender, hdr->data.fail.about.nodename);
                 failing->flags |= CLUSTER_NODE_FAIL;
@@ -2341,16 +2604,30 @@ void clusterReadHandler(connection *conn) {
  * the link to be invalidated, so it is safe to call this function
  * from event handlers that will do stuff with the same link later. */
 void clusterSendMessage(clusterLink *link, unsigned char *msg, size_t msglen) {
-    if (sdslen(link->sndbuf) == 0 && msglen != 0)
-        connSetWriteHandlerWithBarrier(link->conn, clusterWriteHandler, 1);
+    if (link && link->node) {
+        serverLog(LL_DEBUG, "In clusterSendMessage, sending msg to node: %s", link->node->name);
+    } else if(!link) {
+         serverLog(LL_WARNING, "In clusterSendMessage, received link NULL");       
+    } else {
+        serverLog(LL_DEBUG, "In clusterSendMessage, received node NULL");
+    }
 
-    link->sndbuf = sdscatlen(link->sndbuf, msg, msglen);
+    if (server.quic_config.quic_enabled){
+        quicSendMessage(link, msg, msglen);
+    } else {
+        if (sdslen(link->sndbuf) == 0 && msglen != 0)
+                connSetWriteHandlerWithBarrier(link->conn, clusterWriteHandler, 1);
+        
+        link->sndbuf = sdscatlen(link->sndbuf, msg, msglen);
+    }
 
     /* Populate sent messages stats. */
     clusterMsg *hdr = (clusterMsg*) msg;
     uint16_t type = ntohs(hdr->type);
     if (type < CLUSTERMSG_TYPE_COUNT)
         server.cluster->stats_bus_messages_sent[type]++;
+    
+    serverLog(LL_DEBUG, "Exiting clusterSendMessage");
 }
 
 /* Send a message to all the nodes that are part of the cluster having
@@ -2482,6 +2759,15 @@ void clusterSetGossipEntry(clusterMsg *hdr, int i, clusterNode *n) {
 /* Send a PING or PONG packet to the specified node, making sure to add enough
  * gossip information. */
 void clusterSendPing(clusterLink *link, int type) {
+    if (link && link->node) {
+        serverLog(LL_DEBUG, "In clusterSendPing, sending msg type %d to node: %s", 
+                            type, link->node->name);
+    } else if (!link) {
+         serverLog(LL_WARNING, "In clusterSendPing, received link NULL");       
+    } else {
+        serverLog(LL_DEBUG, "In clusterSendPing, received node NULL");
+    }
+
     unsigned char *buf;
     clusterMsg *hdr;
     int gossipcount = 0; /* Number of gossip sections added so far. */
@@ -2607,6 +2893,8 @@ void clusterSendPing(clusterLink *link, int type) {
     hdr->totlen = htonl(totlen);
     clusterSendMessage(link,buf,totlen);
     zfree(buf);
+
+    serverLog(LL_DEBUG, "Exiting clusterSendPing");
 }
 
 /* Send a PONG packet to every connected node that's not in handshake state
@@ -3443,6 +3731,7 @@ void clusterHandleManualFailover(void) {
 
 /* This is executed 10 times every second */
 void clusterCron(void) {
+    serverLog(LL_DEBUG,"Entering clusterCron");
     dictIterator *di;
     dictEntry *de;
     int update_state = 0;
@@ -3513,11 +3802,50 @@ void clusterCron(void) {
         /* A Node in HANDSHAKE state has a limited lifespan equal to the
          * configured node timeout. */
         if (nodeInHandshake(node) && now - node->ctime > handshake_timeout) {
+            serverLog(LL_DEBUG, "Deleting node as handshake timed out. now: %lld node->ctimeTime: %lld", 
+                                now, node->ctime);
             clusterDelNode(node);
             continue;
         }
 
         if (node->link == NULL) {
+            /* if quic enabled*/
+            if (server.quic_config.quic_enabled) {
+                if(!node->toConnectLink){
+                    serverLog(LL_DEBUG, "Link still in connecting state for Cluster Node [%s]:%d", 
+                                        node->ip, node->cport);
+                    continue;
+                }
+
+                node->toConnectLink = 0;
+                serverLog(LL_DEBUG,"Creating dummy link with node %.40s at [%s]:%d", 
+                                    node->name, node->ip, node->cport);
+                
+                clusterLink *link = createClusterLink(node);
+                link->conn = connCreateQuicSocket();
+                connSetPrivateData(link->conn, link);
+                
+                /* Not successful free the cluster link*/
+                if (quicConnect(node, link->conn) == C_ERR) {
+                    /* We got a synchronous error from connect before
+                    * clusterSendPing() had a chance to be called.
+                    * If node->ping_sent is zero, failure detection can't work,
+                    * so we claim we actually sent a ping now (that will
+                    * be really sent as soon as the link is obtained). */
+                    if (node->ping_sent == 0) node->ping_sent = mstime();
+                    serverLog(LL_DEBUG, "Unable to connect to "
+                        "Cluster Node [%s]:%d. Freeing the link", node->ip,
+                        node->cport);
+
+                    node->toConnectLink = 1;
+                    freeClusterLink(link);
+                    continue;
+                }
+
+                continue;
+            }
+
+            /* If not QUIC, then normal functionality*/
             clusterLink *link = createClusterLink(node);
             link->conn = server.tls_cluster ? connCreateTLS() : connCreateSocket();
             connSetPrivateData(link->conn, link);
@@ -3619,6 +3947,8 @@ void clusterCron(void) {
             data_delay > server.cluster_node_timeout/2)
         {
             /* Disconnect the link, it will be reconnected automatically. */
+            serverLog(LL_DEBUG,"Freeing ClusterLink as half node timeout reached for node: %.40s",
+                                node->name);
             freeClusterLink(node->link);
         }
 
@@ -3663,7 +3993,7 @@ void clusterCron(void) {
             /* Timeout reached. Set the node as possibly failing if it is
              * not already in this state. */
             if (!(node->flags & (CLUSTER_NODE_PFAIL|CLUSTER_NODE_FAIL))) {
-                serverLog(LL_DEBUG,"*** NODE %.40s possibly failing",
+                serverLog(LL_WARNING,"*** NODE %.40s possibly failing",
                     node->name);
                 node->flags |= CLUSTER_NODE_PFAIL;
                 update_state = 1;
@@ -3701,6 +4031,8 @@ void clusterCron(void) {
 
     if (update_state || server.cluster->state == CLUSTER_FAIL)
         clusterUpdateState();
+
+    serverLog(LL_DEBUG,"Exiting clusterCron");
 }
 
 /* This function is called before the event handler returns to sleep for
@@ -3709,6 +4041,7 @@ void clusterCron(void) {
  * handlers, or to perform potentially expansive tasks that we need to do
  * a single time before replying to clients. */
 void clusterBeforeSleep(void) {
+    serverLog(LL_DEBUG,"Entering clusterBeforeSleep");
     /* Handle failover, this is needed when it is likely that there is already
      * the quorum from masters in order to react fast. */
     if (server.cluster->todo_before_sleep & CLUSTER_TODO_HANDLE_FAILOVER)
@@ -3728,6 +4061,7 @@ void clusterBeforeSleep(void) {
     /* Reset our flags (not strictly needed since every single function
      * called for flags set should be able to clear its flag). */
     server.cluster->todo_before_sleep = 0;
+    serverLog(LL_DEBUG,"Exiting clusterBeforeSleep");
 }
 
 void clusterDoBeforeSleep(int flags) {
@@ -4318,6 +4652,7 @@ void clusterCommand(client *c) {
         return;
     }
 
+    serverLog(LL_NOTICE, "cluster received command: %s", c->argv[1]->ptr);
     if (c->argc == 2 && !strcasecmp(c->argv[1]->ptr,"help")) {
         const char *help[] = {
 "ADDSLOTS <slot> [slot ...] -- Assign slots to current node.",
@@ -5793,6 +6128,8 @@ clusterNode *getNodeByQuery(client *c, struct redisCommand *cmd, robj **argv, in
  * node we want to mention in the redirection. Moreover hashslot should
  * be set to the hash slot that caused the redirection. */
 void clusterRedirectClient(client *c, clusterNode *n, int hashslot, int error_code) {
+    serverLog(LL_DEBUG, "I am in Redirection code. Hashslot:%d Error code:%d", hashslot, error_code);
+
     if (error_code == CLUSTER_REDIR_CROSS_SLOT) {
         addReplySds(c,sdsnew("-CROSSSLOT Keys in request don't hash to the same slot\r\n"));
     } else if (error_code == CLUSTER_REDIR_UNSTABLE) {
@@ -5882,5 +6219,504 @@ int clusterRedirectBlockedClientIfNeeded(client *c) {
         }
         dictReleaseIterator(di);
     }
+    return 0;
+}
+
+/* This func is the callback handler when new connection on a clusterBus comes 
+ * to this node. The listener will get the connection and give to this function. */
+QUIC_STATUS serverListenerCallBack(HQUIC Listener, void *Context, QUIC_LISTENER_EVENT *Event){
+    QUIC_STATUS Status = QUIC_STATUS_NOT_SUPPORTED;
+
+    switch (Event->Type) {
+        case QUIC_LISTENER_EVENT_NEW_CONNECTION:
+        {
+            //DOUBT: Set the Confiuration of connection - Have to understand why we are doing it?
+            //TODO: What if the status is not good?? We should not create CONN object or set it to a bad state
+            Status = server.cluster->quic_handlers.msquic->ConnectionSetConfiguration(
+                Event->NEW_CONNECTION.Connection, 
+                server.cluster->quic_handlers.server_configuration);
+            
+            serverLog(LL_NOTICE,"Status of ConnectionSetConfiguration in serverListenerCallBack 0x%x\n", Status);
+
+            /* Create the quic_connection object */
+            connection *conn = connCreateAcceptedQuic(Event->NEW_CONNECTION.Connection);
+
+            /* Set CallBackHandler */
+            server.cluster->quic_handlers.msquic->SetCallbackHandler(
+                Event->NEW_CONNECTION.Connection, 
+                (void*)serverConnectionCallBack, 
+                (void*)conn);
+
+            serverLog(LL_NOTICE,"Set the server connection call back handler.");
+
+            break;
+        }
+        default:
+            break;
+    }
+    return Status;
+}
+
+/* This func is the callback handler for various connections events that are fired by MsQUIC */
+QUIC_STATUS serverConnectionCallBack(HQUIC Connection, void *Context, QUIC_CONNECTION_EVENT *Event){
+    //Get the connection object from Context
+    quicConnection *quic_conn = (quicConnection*)Context;
+
+    switch (Event->Type) {
+        case QUIC_CONNECTION_EVENT_CONNECTED:
+        {
+            /* Adding this for debugging purposes. 
+            * Ideally IP has to be stored in conn object and should access here. */
+            // TODO: To be removed
+            // char ip[NET_IP_STR_LEN];
+            // int *port;
+            // getQuicRemoteIP((connection*)Context, ip, sizeof(ip), port);
+            // serverLog(LL_NOTICE,"Incoming connection from: %s:%d", ip, *port);
+
+            /* Changing the status to connected*/
+            quic_conn->conn.state = CONN_STATE_CONNECTED;
+
+            /* create the cluster link for the connection*/
+            clusterLink *link = createClusterLink(NULL);
+            link->conn = (connection *)quic_conn;
+            connSetPrivateData(&(quic_conn->conn), link);
+        
+            break;
+        }
+        case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT:
+        case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_PEER:
+        {
+            clusterLink *link = (clusterLink*)connGetPrivateData(&(quic_conn->conn));
+            if (link) {
+                serverLog(LL_DEBUG, "In serverConnectionCallBack, shutdown intiated and freeing the link");
+                freeClusterLink(link);
+            }
+            break;
+        }
+        case QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE:
+        {
+            /* We should close the connection once the shutdown the complete 
+             * and free the quic_conn object */
+            if (quic_conn){
+                serverLog(LL_DEBUG, "In serverConnectionCallBack, freeing the quic_conn object: %p.", quic_conn);    
+                server.cluster->quic_handlers.msquic->ConnectionClose(quic_conn->quic_conn_handle);
+                zfree(quic_conn);
+            }
+            break;
+        }
+        case QUIC_CONNECTION_EVENT_PEER_STREAM_STARTED:
+        {
+            server.cluster->quic_handlers.msquic->SetCallbackHandler(Event->PEER_STREAM_STARTED.Stream, 
+                                    (void*)quicStreamCallBack, 
+                                    (void*)quic_conn);
+            break;
+        }
+        default:
+            serverLog(LL_WARNING,"Unexpected serverEvent %d", Event->Type);
+            break;
+    }
+
+    return QUIC_STATUS_SUCCESS;
+}
+
+/* This func is the callback handler for various client connections events that are fired by MsQUIC */
+QUIC_STATUS clientConnectionCallBack(HQUIC Connection, void *Context, QUIC_CONNECTION_EVENT *Event){
+    //Get the node object from Context
+    quicConnection *quic_conn = (quicConnection*)Context;
+
+    switch (Event->Type) {
+        case QUIC_CONNECTION_EVENT_CONNECTED:
+        {
+            quic_conn->conn.state = CONN_STATE_CONNECTED;
+
+            /* ---------Replicating functionality of clusterLinkConnectHandler ---------- */
+            
+            /* Queue a PING in the new connection ASAP: this is crucial
+            * to avoid false positives in failure detection.
+            *
+            * If the node is flagged as MEET, we send a MEET message instead
+            * of a PING one, to force the receiver to add us in its node
+            * table. */
+            
+            clusterLink *link = (clusterLink*) connGetPrivateData(&(quic_conn->conn));
+            clusterNode *node = link->node;
+
+            /* Setting the link once the connection is established*/
+            /* Setting toConnectLink too so that future links can be established*/
+            node->link = link;
+            node->toConnectLink = 1;
+            serverLog(LL_DEBUG,"Link established with node %.40s at [%s]:%d", 
+                                            node->name, node->ip, node->cport);
+
+            mstime_t old_ping_sent = node->ping_sent;
+            clusterSendPing(link, node->flags & CLUSTER_NODE_MEET ?
+                    CLUSTERMSG_TYPE_MEET : CLUSTERMSG_TYPE_PING);
+            if (old_ping_sent) {
+                /* If there was an active ping before the link was
+                * disconnected, we want to restore the ping time, otherwise
+                * replaced by the clusterSendPing() call. */
+                node->ping_sent = old_ping_sent;
+            }
+            /* We can clear the flag after the first packet is sent.
+            * If we'll never receive a PONG, we'll never send new packets
+            * to this node. Instead after the PONG is received and we
+            * are no longer in meet/handshake status, we want to send
+            * normal PING packets. */
+            node->flags &= ~CLUSTER_NODE_MEET;
+
+            serverLog(LL_NOTICE,"Connecting with Node %.40s at %s:%d",
+                    node->name, node->ip, node->cport);
+            
+            break;
+        }
+
+        case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT:
+        case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_PEER:
+        {
+            clusterLink *link = (clusterLink*)connGetPrivateData(&(quic_conn->conn));
+            if (link) {
+                clusterNode *node = link->node;
+                node->toConnectLink = 1;
+                
+                serverLog(LL_DEBUG, "In clientConnectionCallBack, shutdown intiated and freeing the link");
+                freeClusterLink(link);
+            }
+            break;
+        }
+        case QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE:
+        {
+            /* We should close the connection once the shutdown the complete 
+             * and free the quic_conn object */
+            if (quic_conn){
+                serverLog(LL_DEBUG, "In clientConnectionCallBack, freeing the quic_conn object: %p.", quic_conn);     
+                server.cluster->quic_handlers.msquic->ConnectionClose(quic_conn->quic_conn_handle);
+                zfree(quic_conn);
+            }
+            break;
+        }
+        case QUIC_CONNECTION_EVENT_PEER_STREAM_STARTED:
+        {
+            /* Set callback handler for handling replied received from peer in same link*/
+            server.cluster->quic_handlers.msquic->SetCallbackHandler(Event->PEER_STREAM_STARTED.Stream, (void*)quicStreamCallBack, (void*)Context);
+            break;
+        }
+        default:
+            serverLog(LL_WARNING,"Unexpected clientEvent %d", Event->Type);
+            break;
+    }
+
+    return QUIC_STATUS_SUCCESS;
+}
+
+QUIC_STATUS quicStreamCallBack(HQUIC Stream, void *Context, QUIC_STREAM_EVENT *Event)
+{
+    //Get the connection object from Context
+    quicConnection *quic_conn = (quicConnection*)Context;
+
+    switch (Event->Type) 
+    {
+        case QUIC_STREAM_EVENT_START_COMPLETE:
+        {
+            // This event is triggered if we are using async stream start. 
+            serverLog(LL_NOTICE,"Received stream start event complete.");
+            break;
+        }
+        case QUIC_STREAM_EVENT_RECEIVE:
+        {
+            serverLog(LL_NOTICE,"Received stream event receive.");
+
+            /* Checking if the received stream data containing header,
+            *  if not informing the MsQuic library that no data has consumed and 
+            *  setting receive enabled flag, inorder to receive the data from 
+            *  first byte in the next event.*/
+            if (Event->RECEIVE.TotalBufferLength <= 8)
+            {
+                Event->RECEIVE.TotalBufferLength = 0;
+
+                /* Removing the cluster link if we are unable to set receive 
+                *  enabled flag. As MsQuic blocks sending data to app incase 
+                *  of entire data not consumed. */
+                QUIC_STATUS status;
+                if(QUIC_FAILED(status = server.cluster->quic_handlers.msquic->StreamReceiveSetEnabled(
+                        Stream,
+                        true)))
+                {
+                    clusterLink* link = (clusterLink*)connGetPrivateData(&(quic_conn->conn));
+                    serverLog(LL_WARNING,"MsQuic stream receive set enabled failed and removing link.");
+                    freeClusterLink(link);
+                }
+            }
+            else
+            {
+                quicStreamReadHandler(Stream, quic_conn, Event);
+            }
+            break;
+        }
+        case QUIC_STREAM_EVENT_SEND_COMPLETE:
+        {
+            /* Freeing the Buffer allocated 
+             * MSquic just copies the buffer app gave and fires this event
+             * App is responsible for clearing any buffer allocated */
+            zfree(Event->SEND_COMPLETE.ClientContext);
+            serverLog(LL_NOTICE,"Received stream send event complete.");
+            break;
+        }
+        case QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN:
+        {
+            serverLog(LL_NOTICE,"Received stream peer event send shutdown.");
+            break;
+        }
+        case QUIC_STREAM_EVENT_PEER_SEND_ABORTED:
+        {
+            serverLog(LL_NOTICE,"Received stream peer event send aborted.");
+            break;
+        }
+        case QUIC_STREAM_EVENT_PEER_RECEIVE_ABORTED:
+        {
+            serverLog(LL_NOTICE,"Received stream peer event receive aborted.");
+            break;
+        }
+        case QUIC_STREAM_EVENT_SEND_SHUTDOWN_COMPLETE:
+        {
+            serverLog(LL_NOTICE,"Received stream event send shutdown complete.");
+            break;
+        }
+        case QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE:
+        {
+            serverLog(LL_NOTICE,"Received stream event shutdown complete.");
+            /* Closing the stream.*/
+            server.cluster->quic_handlers.msquic->StreamClose(Stream);
+            break;
+        }
+        case QUIC_STREAM_EVENT_IDEAL_SEND_BUFFER_SIZE:
+        {
+            serverLog(LL_NOTICE,"Received stream event ideal send buffer size.");
+            break;
+        }
+    }
+
+    return QUIC_STATUS_SUCCESS;
+}
+
+/* Read data. Try to read the first field of the header first to check the
+ * full length of the packet. When a whole packet is in memory this function
+ * will call the function to process the packet. And so forth. */
+void quicStreamReadHandler(HQUIC Stream, quicConnection *quic_conn, QUIC_STREAM_EVENT *Event) 
+{
+    connection *conn = &(quic_conn->conn);
+    clusterMsg buf[1];
+    uint64_t nread;
+    clusterLink *link = connGetPrivateData(conn);
+
+    /* Adding this for debugging purposes. 
+     * Ideally IP has to be stored in conn object and should access here. */
+    // TODO: To be removed
+    // char ip[NET_IP_STR_LEN];
+    // int *port;
+    // getQuicRemoteIP(link->conn, ip, sizeof(ip), port);
+    // serverLog(LL_DEBUG,"Entering quicStreamReadHandler %s:%d.", ip, *port);
+    serverLog(LL_DEBUG,"Entering quicStreamReadHandler");
+    if (link && link->node){
+        serverLog(LL_DEBUG, "In quicStreamReadHandler, Received packet from node: %s", link->node->name);
+    } else if (!link) {
+        serverLog(LL_WARNING,"In quicStreamReadHandler, link is NULL");
+    } else {
+        serverLog(LL_DEBUG,"In quicStreamReadHandler, node is NULL");
+    }
+
+    // Copying the quic buffer to clustermsg buf object.
+    nread = 0;
+    int headerChecked = 0;
+    for (uint32_t i = 0; i < Event->RECEIVE.BufferCount; ++i) 
+    {
+        memcpy(
+            ((uint8_t*)buf) + nread,
+            Event->RECEIVE.Buffers[i].Buffer,
+            Event->RECEIVE.Buffers[i].Length);
+            nread += Event->RECEIVE.Buffers[i].Length;
+
+        /* Checking if the data contains the entire the clusterMsg.
+        *  If not informing the MsQuic library that no data has been consumed.*/
+        if (nread >= 8 && !headerChecked)
+        {
+            /* Perform some sanity check on the message signature
+            * and length. */
+            uint32_t msg_len = ntohl(buf[0].totlen);
+            if (memcmp(buf[0].sig,"RCmb",4) != 0 ||
+                msg_len < CLUSTERMSG_MIN_LEN)
+            {
+                serverLog(LL_WARNING,
+                    "Bad message length or signature received "
+                    "from Cluster bus.");
+                freeClusterLink(link);
+                return;
+            }
+
+            /* The entire message is not present in the currect quic 
+            *  stream buffer. */
+            if(msg_len != Event->RECEIVE.TotalBufferLength)
+            {
+                Event->RECEIVE.TotalBufferLength = 0;
+
+                /* Removing the cluster link if we are unable to set receive 
+                *  enabled flag. As MsQuic blocks sending data to app incase 
+                *  of entire data not consumed. */
+                QUIC_STATUS status;
+                if(QUIC_FAILED(status = 
+                    server.cluster->quic_handlers.msquic->StreamReceiveSetEnabled(
+                        Stream,
+                        true)))
+                {
+                    serverLog(LL_WARNING,"MsQuic stream receive set enabled failed and removing link.");
+                    freeClusterLink(link);
+                }
+
+                return;
+            }
+            headerChecked = 1;
+        }
+    }
+   
+    /* Read data and recast the pointer to the new buffer. */
+    link->rcvbuf = sdscatlen(link->rcvbuf,buf, sizeof(buf));
+
+    clusterProcessPacket(link);
+    sdsfree(link->rcvbuf);
+    link->rcvbuf = sdsempty();
+    serverLog(LL_DEBUG,"Exiting quicStreamReadHandler.");
+    return;
+}
+
+int quicConnect(clusterNode* node, connection* conn){
+    QUIC_STATUS Status;
+    HQUIC Connection = NULL;
+
+    /* Open new Connection*/
+    if (QUIC_FAILED(Status = server.cluster->quic_handlers.msquic->ConnectionOpen(
+                                                    server.cluster->quic_handlers.registration, 
+                                                    clientConnectionCallBack, 
+                                                    conn, &Connection))) {
+        serverLog(LL_WARNING, "MsQUIC ConnectionOpen failed, 0x%x for Cluster Node [%s]:%d\n", 
+                Status, node->ip, node->cport);
+        
+        return C_ERR;
+    }
+
+    /* Start the connection*/
+    if (QUIC_FAILED(Status = server.cluster->quic_handlers.msquic->ConnectionStart(
+                                                    Connection, 
+                                                    server.cluster->quic_handlers.client_configuration, 
+                                                    QUIC_ADDRESS_FAMILY_UNSPEC,
+                                                    node->ip, 
+                                                    node->cport))) {
+        serverLog(LL_WARNING, "MsQUIC ConnectionStart failed, 0x%x for Cluster Node [%s]:%d\n", 
+                            Status, node->ip, node->cport);
+
+        server.cluster->quic_handlers.msquic->ConnectionClose(Connection);
+        return C_ERR;
+    }
+
+    quicConnection *quic_conn = (quicConnection*) conn;
+    quic_conn->quic_conn_handle = Connection;
+    quic_conn->conn.state = CONN_STATE_CONNECTING;
+
+    return C_OK;
+}
+
+void quicSendMessage(clusterLink *link, unsigned char *msg, size_t msglen){
+    if (link && link->node) {
+        serverLog(LL_DEBUG, "In quicSendMessage, sending msg to node: %s", link->node->name);
+    } else if(!link) {
+         serverLog(LL_WARNING, "In quicSendMessage, received link NULL");       
+    }
+    else {
+        serverLog(LL_DEBUG, "In quicSendMessage, received node NULL");
+    }
+
+    quicConnection* conn = (quicConnection*) link->conn;
+
+    QUIC_STATUS Status;
+    HQUIC Stream = NULL;
+    uint8_t* SendBufferRaw;
+    QUIC_BUFFER* SendBuffer;
+
+    // Create a unidirectional stream to send the packet
+    if (QUIC_FAILED(Status = server.cluster->quic_handlers.msquic->StreamOpen(
+                            conn->quic_conn_handle, 
+                            QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL, 
+                            quicStreamCallBack, 
+                            conn, 
+                            &Stream))) {
+        
+        serverLog(LL_WARNING, "StreamOpen failed, 0x%x!\n", Status);
+        
+        freeClusterLink(link);
+        return;
+    }
+
+/*
+
+    // Start the stream 
+    if (QUIC_FAILED(Status = server.cluster->quic_handlers.msquic->StreamStart(
+                                    Stream, 
+                                    QUIC_STREAM_START_FLAG_NONE))) {
+        serverLog(LL_WARNING, "StreamStart failed, 0x%x!\n", Status);
+        server.cluster->quic_handlers.msquic->StreamClose(Stream);
+
+        freeClusterLink(link);
+        return;
+    }
+*/
+    /* Allocate & copy the Buffer*/
+    SendBufferRaw = (uint8_t*)zmalloc(sizeof(QUIC_BUFFER) + msglen);
+    
+    SendBuffer = (QUIC_BUFFER*)SendBufferRaw;
+    SendBuffer->Buffer = SendBufferRaw + sizeof(QUIC_BUFFER);
+    SendBuffer->Length = msglen;
+    
+    /* Copy the Buffer */
+    memcpy(SendBuffer->Buffer, msg, msglen);
+
+    /* Send the data and shutdown the stream by sending the FIN FLAG*/
+    if (QUIC_FAILED(Status = server.cluster->quic_handlers.msquic->StreamSend(Stream, 
+                                                SendBuffer, 
+                                                1, //Buffer Count
+                                                QUIC_SEND_FLAG_START | QUIC_SEND_FLAG_FIN, 
+                                                SendBuffer))) {
+        serverLog(LL_WARNING, "StreamSend failed, 0x%x!\n", Status);
+        zfree(SendBufferRaw);
+
+        freeClusterLink(link);
+    }
+
+    serverLog(LL_DEBUG, "Exiting quicSendMessage");
+}
+
+int getQuicRemoteIP(connection *conn, char *ip, size_t ip_len, int *port) {
+    quicConnection *quic_conn = (quicConnection*)conn;
+
+    QUIC_ADDR addr;
+    uint32_t addrLen = sizeof(addr);
+    QUIC_STATUS status =
+        server.cluster->quic_handlers.msquic->GetParam(
+            quic_conn->quic_conn_handle,
+            QUIC_PARAM_LEVEL_CONNECTION,
+            QUIC_PARAM_CONN_REMOTE_ADDRESS,
+            &addrLen,
+            &addr);
+    
+    if (QUIC_FAILED(status) && ip) {
+        if (ip_len >= 2) {
+            ip[0] = '?';
+            ip[1] = '\0';
+        } else if (ip_len == 1) {
+            ip[0] = '\0';
+        }
+        return -1;
+    }
+
+    struct sockaddr_in *s = (struct sockaddr_in *)&(addr.Ipv4);
+    if (ip) inet_ntop(AF_INET,(void*)&(s->sin_addr),ip,ip_len);
+    if (port) *port = ntohs(s->sin_port);
     return 0;
 }
